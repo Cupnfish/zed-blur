@@ -1256,3 +1256,103 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/*
+**
+**              Backdrop blur
+**
+*/
+
+struct BackdropBlur {
+    uint order;
+    float blur_radius;
+    Bounds bounds;
+    Bounds content_mask;
+    Corners corner_radii;
+    float saturation;
+    uint pad;
+};
+
+struct BackdropBlurPassParams {
+    float2 src_texel_size;
+    // Blur direction in texels; (0, 0) performs a plain downsampling blit.
+    float2 direction;
+    float sigma;
+    float taps;
+    float2 pad;
+};
+
+StructuredBuffer<BackdropBlurPassParams> backdrop_blur_pass_params: register(t1);
+
+struct BackdropBlurPassVertexOutput {
+    float4 position: SV_Position;
+    float2 texture_coords: TEXCOORD0;
+};
+
+BackdropBlurPassVertexOutput backdrop_blur_pass_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    BackdropBlurPassVertexOutput output;
+    output.position = float4(unit_vertex * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    output.texture_coords = unit_vertex;
+    return output;
+}
+
+float4 backdrop_blur_pass_fragment(BackdropBlurPassVertexOutput input): SV_Target {
+    BackdropBlurPassParams params = backdrop_blur_pass_params[0];
+    if (params.sigma < 0.05 || dot(params.direction, params.direction) == 0.0) {
+        return t_sprite.Sample(s_sprite, input.texture_coords);
+    }
+    float2 step_size = params.direction * params.src_texel_size;
+    float4 sum = t_sprite.Sample(s_sprite, input.texture_coords);
+    float total = 1.0;
+    int taps = int(params.taps);
+    [loop]
+    for (int i = 1; i <= taps; i++) {
+        float weight = exp(-float(i * i) / (2.0 * params.sigma * params.sigma));
+        sum += (t_sprite.Sample(s_sprite, input.texture_coords + step_size * float(i)) +
+                t_sprite.Sample(s_sprite, input.texture_coords - step_size * float(i))) * weight;
+        total += 2.0 * weight;
+    }
+    return sum / total;
+}
+
+StructuredBuffer<BackdropBlur> backdrop_blurs: register(t1);
+
+struct BackdropBlurVertexOutput {
+    nointerpolation uint blur_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_coords: TEXCOORD1;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct BackdropBlurFragmentInput {
+    nointerpolation uint blur_id: TEXCOORD0;
+    float4 position: SV_Position;
+    float2 texture_coords: TEXCOORD1;
+};
+
+BackdropBlurVertexOutput backdrop_blur_vertex(uint vertex_id: SV_VertexID, uint blur_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    BackdropBlur blur = backdrop_blurs[blur_id];
+    float4 device_position = to_device_position(unit_vertex, blur.bounds);
+    float2 screen_position = blur.bounds.origin + unit_vertex * blur.bounds.size;
+
+    BackdropBlurVertexOutput output;
+    output.blur_id = blur_id;
+    output.position = device_position;
+    output.texture_coords = screen_position / global_viewport_size;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, blur.bounds, blur.content_mask);
+    return output;
+}
+
+float4 backdrop_blur_fragment(BackdropBlurFragmentInput input): SV_Target {
+    BackdropBlur blur = backdrop_blurs[input.blur_id];
+    float4 color = t_sprite.Sample(s_sprite, input.texture_coords);
+
+    float luminance = dot(color.rgb, GRAYSCALE_FACTORS);
+    color.rgb = lerp(float3(luminance, luminance, luminance), color.rgb, blur.saturation);
+
+    float distance = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
+    float alpha = saturate(0.5 - distance);
+    return float4(color.rgb * alpha, alpha);
+}
