@@ -1,9 +1,9 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite, Path, Point,
-    PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size, SubpixelSprite,
-    Underline, get_gamma_correction_ratios,
+    AtlasTextureId, BackdropBlur, Background, Bounds, DevicePixels, GpuSpecs, MonochromeSprite,
+    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
+    SubpixelSprite, Underline, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -69,6 +69,24 @@ struct PathRasterizationVertex {
     bounds: Bounds<ScaledPixels>,
 }
 
+// Backdrop blurs run on a downsampled copy of the framebuffer; higher is faster.
+const BLUR_DOWNSAMPLE: u32 = 2;
+
+/// Parameters for one downsample/blur pass over the captured framebuffer.
+#[derive(Clone, Debug)]
+#[repr(C)]
+struct BackdropBlurPassParams {
+    /// `1.0 / size` of the texture being sampled.
+    src_texel_size: [f32; 2],
+    /// Blur direction in texels; `(0, 0)` performs a plain downsampling blit.
+    direction: [f32; 2],
+    /// Gaussian sigma in downsampled texels.
+    sigma: f32,
+    /// Number of taps on each side of the center sample.
+    taps: f32,
+    pad: [f32; 2],
+}
+
 pub struct WgpuSurfaceConfig {
     pub size: Size<DevicePixels>,
     pub transparent: bool,
@@ -90,6 +108,8 @@ struct WgpuPipelines {
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
+    backdrop_blur_pass: wgpu::RenderPipeline,
+    backdrop_blurs: wgpu::RenderPipeline,
     #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
 }
@@ -99,6 +119,8 @@ struct WgpuBindGroupLayouts {
     instances: wgpu::BindGroupLayout,
     instances_with_texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+    /// Uniform + source texture + sampler for one backdrop blur pass.
+    backdrop_blur_pass: wgpu::BindGroupLayout,
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -120,6 +142,14 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    // Backdrop blur intermediates: a full-size copy of the framebuffer plus a
+    // downsampled ping/pong pair for the separable gaussian passes.
+    blur_source_texture: Option<wgpu::Texture>,
+    blur_source_view: Option<wgpu::TextureView>,
+    blur_ping_texture: Option<wgpu::Texture>,
+    blur_ping_view: Option<wgpu::TextureView>,
+    blur_pong_texture: Option<wgpu::Texture>,
+    blur_pong_view: Option<wgpu::TextureView>,
 }
 
 impl WgpuResources {
@@ -128,6 +158,12 @@ impl WgpuResources {
         self.path_intermediate_view = None;
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
+        self.blur_source_texture = None;
+        self.blur_source_view = None;
+        self.blur_ping_texture = None;
+        self.blur_ping_view = None;
+        self.blur_pong_texture = None;
+        self.blur_pong_view = None;
     }
 }
 
@@ -153,6 +189,9 @@ pub struct WgpuRenderer {
     transparent_alpha_mode: wgpu::CompositeAlphaMode,
     opaque_alpha_mode: wgpu::CompositeAlphaMode,
     max_texture_size: u32,
+    /// Whether the surface supports `COPY_SRC`, required to capture the
+    /// framebuffer for backdrop blur primitives.
+    surface_supports_copy: bool,
     last_error: Arc<Mutex<Option<String>>>,
     failed_frame_count: u32,
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -331,7 +370,10 @@ impl WgpuRenderer {
         }
 
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // COPY_SRC lets backdrop blur primitives capture the framebuffer;
+            // surfaces that don't support it skip backdrop blurs entirely.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | (surface_caps.usages & wgpu::TextureUsages::COPY_SRC),
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
@@ -463,6 +505,12 @@ impl WgpuRenderer {
             path_intermediate_view: None,
             path_msaa_texture: None,
             path_msaa_view: None,
+            blur_source_texture: None,
+            blur_source_view: None,
+            blur_ping_texture: None,
+            blur_ping_view: None,
+            blur_pong_texture: None,
+            blur_pong_view: None,
         };
 
         Ok(Self {
@@ -483,6 +531,7 @@ impl WgpuRenderer {
             transparent_alpha_mode,
             opaque_alpha_mode,
             max_texture_size,
+            surface_supports_copy: surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC),
             last_error,
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
@@ -607,11 +656,45 @@ impl WgpuRenderer {
             ],
         });
 
+        let backdrop_blur_pass =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("backdrop_blur_pass_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
         WgpuBindGroupLayouts {
             globals,
             instances,
             instances_with_texture,
             surfaces,
+            backdrop_blur_pass,
         }
     }
 
@@ -872,6 +955,36 @@ impl WgpuRenderer {
             &layouts.globals,
             &layouts.surfaces,
             wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(color_target.clone())],
+            1,
+            &shader_module,
+        );
+
+        // The downsample/blur passes fully overwrite their offscreen targets,
+        // so they render without blending.
+        let backdrop_blur_pass = create_pipeline(
+            "backdrop_blur_pass",
+            "vs_backdrop_blur_pass",
+            "fs_backdrop_blur_pass",
+            &layouts.globals,
+            &layouts.backdrop_blur_pass,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
+        let backdrop_blurs = create_pipeline(
+            "backdrop_blurs",
+            "vs_backdrop_blur",
+            "fs_backdrop_blur",
+            &layouts.globals,
+            &layouts.instances_with_texture,
+            wgpu::PrimitiveTopology::TriangleStrip,
             &[Some(color_target)],
             1,
             &shader_module,
@@ -887,6 +1000,8 @@ impl WgpuRenderer {
             subpixel_sprites,
             poly_sprites,
             surfaces,
+            backdrop_blur_pass,
+            backdrop_blurs,
         }
     }
 
@@ -981,6 +1096,15 @@ impl WgpuRenderer {
             if let Some(ref texture) = resources.path_msaa_texture {
                 texture.destroy();
             }
+            if let Some(ref texture) = resources.blur_source_texture {
+                texture.destroy();
+            }
+            if let Some(ref texture) = resources.blur_ping_texture {
+                texture.destroy();
+            }
+            if let Some(ref texture) = resources.blur_pong_texture {
+                texture.destroy();
+            }
 
             resources
                 .surface
@@ -1019,6 +1143,59 @@ impl WgpuRenderer {
         .unwrap_or((None, None));
         resources.path_msaa_texture = path_msaa_texture;
         resources.path_msaa_view = path_msaa_view;
+    }
+
+    /// Lazily creates the backdrop blur intermediates; only called for frames
+    /// whose scene actually contains backdrop blur primitives.
+    fn ensure_backdrop_blur_textures(&mut self) {
+        if !self.surface_supports_copy || self.resources().blur_ping_view.is_some() {
+            return;
+        }
+
+        let format = self.surface_config.format;
+        let width = self.surface_config.width.max(1);
+        let height = self.surface_config.height.max(1);
+        let downsampled_width = width.div_ceil(BLUR_DOWNSAMPLE).max(1);
+        let downsampled_height = height.div_ceil(BLUR_DOWNSAMPLE).max(1);
+        let resources = self.resources_mut();
+
+        // Full-size destination for copying the current framebuffer, since
+        // the surface texture itself cannot be sampled.
+        let source_texture = resources.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("backdrop_blur_source"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        resources.blur_source_view =
+            Some(source_texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        resources.blur_source_texture = Some(source_texture);
+
+        let (ping, ping_view) = Self::create_path_intermediate(
+            &resources.device,
+            format,
+            downsampled_width,
+            downsampled_height,
+        );
+        resources.blur_ping_texture = Some(ping);
+        resources.blur_ping_view = Some(ping_view);
+
+        let (pong, pong_view) = Self::create_path_intermediate(
+            &resources.device,
+            format,
+            downsampled_width,
+            downsampled_height,
+        );
+        resources.blur_pong_texture = Some(pong);
+        resources.blur_pong_view = Some(pong_view);
     }
 
     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {
@@ -1150,6 +1327,9 @@ impl WgpuRenderer {
 
         // Now that we know the surface is healthy, ensure intermediate textures exist
         self.ensure_intermediate_textures();
+        if !scene.backdrop_blurs.is_empty() {
+            self.ensure_backdrop_blur_textures();
+        }
 
         let frame_view = frame
             .texture
@@ -1231,6 +1411,57 @@ impl WgpuRenderer {
 
                 for batch in scene.batches() {
                     let ok = match batch {
+                        PrimitiveBatch::BackdropBlurs(range) => {
+                            let blurs = &scene.backdrop_blurs[range];
+                            if blurs.is_empty() {
+                                continue;
+                            }
+                            if !self.surface_supports_copy
+                                || self.resources().blur_ping_view.is_none()
+                            {
+                                // This surface can't be captured; leave the
+                                // backdrop sharp instead of failing the frame.
+                                continue;
+                            }
+
+                            let mut ok = true;
+                            for blur in blurs {
+                                drop(pass);
+
+                                let did_draw = self.encode_backdrop_blur_passes(
+                                    &mut encoder,
+                                    &frame.texture,
+                                    blur,
+                                    &mut instance_offset,
+                                );
+
+                                pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                    label: Some("main_pass_continued"),
+                                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                        view: &frame_view,
+                                        resolve_target: None,
+                                        ops: wgpu::Operations {
+                                            load: wgpu::LoadOp::Load,
+                                            store: wgpu::StoreOp::Store,
+                                        },
+                                        depth_slice: None,
+                                    })],
+                                    depth_stencil_attachment: None,
+                                    ..Default::default()
+                                });
+
+                                ok = did_draw
+                                    && self.draw_backdrop_blur(
+                                        blur,
+                                        &mut instance_offset,
+                                        &mut pass,
+                                    );
+                                if !ok {
+                                    break;
+                                }
+                            }
+                            ok
+                        }
                         PrimitiveBatch::Quads(range) => {
                             self.draw_quads(&scene.quads[range], &mut instance_offset, &mut pass)
                         }
@@ -1337,6 +1568,158 @@ impl WgpuRenderer {
             frame.present();
             return true;
         }
+    }
+
+    /// Copies the current framebuffer into the blur source texture, then runs
+    /// a separable gaussian blur (downsample → H pass → V pass) into the ping
+    /// texture via `encoder` render passes.
+    fn encode_backdrop_blur_passes(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        frame_texture: &wgpu::Texture,
+        blur: &BackdropBlur,
+        instance_offset: &mut u64,
+    ) -> bool {
+        let resources = self.resources();
+        let (Some(source_view), Some(ping_view), Some(pong_view)) = (
+            &resources.blur_source_view,
+            &resources.blur_ping_view,
+            &resources.blur_pong_view,
+        ) else {
+            return false;
+        };
+
+        // Copy the current (rendered-so-far) framebuffer to the source texture
+        // so we can sample it. The frame texture has COPY_SRC usage.
+        let extent = wgpu::Extent3d {
+            width: self.surface_config.width,
+            height: self.surface_config.height,
+            depth_or_array_layers: 1,
+        };
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: frame_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: resources.blur_source_texture.as_ref().unwrap(),
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            extent,
+        );
+
+        let w = self.surface_config.width as f32;
+        let h = self.surface_config.height as f32;
+        let dw = (self.surface_config.width.div_ceil(BLUR_DOWNSAMPLE)) as f32;
+        let dh = (self.surface_config.height.div_ceil(BLUR_DOWNSAMPLE)) as f32;
+
+        let sigma = (blur.blur_radius.0 / (2.0 * BLUR_DOWNSAMPLE as f32)).max(0.0);
+        let taps = (2.5 * sigma).ceil().clamp(0.0, 64.0);
+
+        // Three passes: downsample blit, horizontal blur, vertical blur
+        let passes = [
+            (source_view as &wgpu::TextureView, ping_view as &wgpu::TextureView, [0.0f32, 0.0], [1.0/w, 1.0/h]),
+            (ping_view,                          pong_view,                       [1.0, 0.0],    [1.0/dw, 1.0/dh]),
+            (pong_view,                          ping_view,                       [0.0, 1.0],    [1.0/dw, 1.0/dh]),
+        ];
+
+        for (src, dst, direction, texel_size) in passes {
+            let params = BackdropBlurPassParams {
+                src_texel_size: texel_size,
+                direction,
+                sigma,
+                taps,
+                pad: [0.0; 2],
+            };
+            let param_data = unsafe { Self::instance_bytes(std::slice::from_ref(&params)) };
+            let Some((offset, size)) = self.write_to_instance_buffer(instance_offset, param_data)
+            else {
+                return false;
+            };
+
+            let bind_group =
+                resources
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &resources.bind_group_layouts.backdrop_blur_pass,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.instance_binding(offset, size),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(src),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(
+                                    &resources.atlas_sampler,
+                                ),
+                            },
+                        ],
+                    });
+
+            let target_width = if std::ptr::eq(dst, ping_view) || std::ptr::eq(dst, pong_view) {
+                dw as u32
+            } else {
+                self.surface_config.width
+            };
+            let target_height = if std::ptr::eq(dst, ping_view) || std::ptr::eq(dst, pong_view) {
+                dh as u32
+            } else {
+                self.surface_config.height
+            };
+            let _ = (target_width, target_height); // consumed by render pass viewport implicitly
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("backdrop_blur_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: dst,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&resources.pipelines.backdrop_blur_pass);
+            // group(0) is globals; group(1) is blur pass data
+            pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+            pass.set_bind_group(1, &bind_group, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        true
+    }
+
+    /// Composites the blurred ping texture back onto the framebuffer, masked by
+    /// the primitive's rounded corners.
+    fn draw_backdrop_blur(
+        &self,
+        blur: &BackdropBlur,
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> bool {
+        let Some(ping_view) = &self.resources().blur_ping_view else {
+            return false;
+        };
+        let data = unsafe { Self::instance_bytes(std::slice::from_ref(blur)) };
+        self.draw_instances_with_texture(
+            data,
+            1,
+            ping_view,
+            &self.resources().pipelines.backdrop_blurs,
+            instance_offset,
+            pass,
+        )
     }
 
     fn draw_quads(

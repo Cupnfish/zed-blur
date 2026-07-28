@@ -7,9 +7,9 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite, PaintSurface,
-    Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow, Size,
-    Surface, Underline, point, size,
+    AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite,
+    PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
+    Size, Surface, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -39,6 +39,8 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
+// Backdrop blurs run on a downsampled copy of the framebuffer; higher is faster.
+const BLUR_DOWNSAMPLE: u32 = 2;
 
 pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
 pub(crate) type Renderer = MetalRenderer;
@@ -125,6 +127,8 @@ pub(crate) struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     surfaces_pipeline_state: metal::RenderPipelineState,
+    backdrop_blur_pass_pipeline_state: metal::RenderPipelineState,
+    backdrop_blur_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -133,6 +137,10 @@ pub(crate) struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
+    /// Downsampled ping/pong pair used to blur the framebuffer behind
+    /// `BackdropBlur` primitives.
+    blur_ping_texture: Option<metal::Texture>,
+    blur_pong_texture: Option<metal::Texture>,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
@@ -159,8 +167,10 @@ impl MetalRenderer {
         // https://developer.apple.com/documentation/metal/managing-your-game-window-for-metal-in-macos
         layer.set_opaque(!transparent);
         layer.set_maximum_drawable_count(3);
-        // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
-        #[cfg(any(test, feature = "test-support"))]
+        // Allow reading back from the drawable: visual tests capture
+        // screenshots from it, and backdrop blur primitives sample the
+        // rendered framebuffer. This opts the layer out of direct-to-display
+        // scanout; macOS composites it through the WindowServer instead.
         layer.set_framebuffer_only(false);
         unsafe {
             let _: () = msg_send![&*layer, setAllowsNextDrawableTimeout: NO];
@@ -322,6 +332,22 @@ impl MetalRenderer {
             "surface_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let backdrop_blur_pass_pipeline_state = build_blur_pass_pipeline_state(
+            &device,
+            &library,
+            "backdrop_blur_passes",
+            "backdrop_blur_pass_vertex",
+            "backdrop_blur_pass_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let backdrop_blur_pipeline_state = build_path_sprite_pipeline_state(
+            &device,
+            &library,
+            "backdrop_blurs",
+            "backdrop_blur_vertex",
+            "backdrop_blur_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -344,6 +370,8 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             surfaces_pipeline_state,
+            backdrop_blur_pass_pipeline_state,
+            backdrop_blur_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -351,6 +379,8 @@ impl MetalRenderer {
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
+            blur_ping_texture: None,
+            blur_pong_texture: None,
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
         }
@@ -401,6 +431,8 @@ impl MetalRenderer {
         if size.width.0 <= 0 || size.height.0 <= 0 {
             self.path_intermediate_texture = None;
             self.path_intermediate_msaa_texture = None;
+            self.blur_ping_texture = None;
+            self.blur_pong_texture = None;
             return;
         }
 
@@ -430,6 +462,21 @@ impl MetalRenderer {
         } else {
             self.path_intermediate_msaa_texture = None;
         }
+
+        // Backdrop blurs run on a downsampled copy of the framebuffer.
+        let blur_descriptor = metal::TextureDescriptor::new();
+        blur_descriptor.set_width((size.width.0 as u64).div_ceil(BLUR_DOWNSAMPLE as u64).max(1));
+        blur_descriptor.set_height(
+            (size.height.0 as u64)
+                .div_ceil(BLUR_DOWNSAMPLE as u64)
+                .max(1),
+        );
+        blur_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        blur_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        blur_descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        self.blur_ping_texture = Some(self.device.new_texture(&blur_descriptor));
+        self.blur_pong_texture = Some(self.device.new_texture(&blur_descriptor));
     }
 
     pub fn update_transparency(&mut self, transparent: bool) {
@@ -849,6 +896,40 @@ impl MetalRenderer {
 
         for batch in scene.batches() {
             let ok = match batch {
+                PrimitiveBatch::BackdropBlurs(range) => {
+                    let blurs = &scene.backdrop_blurs[range];
+                    let mut ok = true;
+                    for blur in blurs {
+                        // The blur passes need their own encoders and must
+                        // observe everything painted so far, so the current
+                        // encoder ends before them and the primitive is
+                        // composited on a fresh encoder that loads the
+                        // existing framebuffer contents.
+                        command_encoder.end_encoding();
+                        let did_draw =
+                            self.draw_backdrop_blur_passes(blur, texture, command_buffer);
+                        command_encoder = new_command_encoder_for_texture(
+                            command_buffer,
+                            texture,
+                            viewport_size,
+                            |color_attachment| {
+                                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+                            },
+                        );
+                        ok = did_draw
+                            && self.draw_backdrop_blur(
+                                blur,
+                                instance_buffer,
+                                &mut instance_offset,
+                                viewport_size,
+                                command_encoder,
+                            );
+                        if !ok {
+                            break;
+                        }
+                    }
+                    ok
+                }
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(
                     &scene.shadows[range],
                     instance_buffer,
@@ -956,6 +1037,134 @@ impl MetalRenderer {
         }
 
         Ok(command_buffer.to_owned())
+    }
+
+    /// Downsamples the framebuffer rendered so far into the ping texture and
+    /// gaussian-blurs it horizontally and vertically. Runs on its own render
+    /// passes; the caller must have ended the main encoder.
+    fn draw_backdrop_blur_passes(
+        &self,
+        blur: &BackdropBlur,
+        source_texture: &metal::TextureRef,
+        command_buffer: &metal::CommandBufferRef,
+    ) -> bool {
+        let (Some(ping_texture), Some(pong_texture)) =
+            (&self.blur_ping_texture, &self.blur_pong_texture)
+        else {
+            return false;
+        };
+
+        // The gaussian blur is separable and runs at the downsampled size.
+        let sigma = (blur.blur_radius.0 / (2.0 * BLUR_DOWNSAMPLE as f32)).max(0.0);
+        let taps = (2.5 * sigma).ceil().clamp(0.0, 64.0);
+
+        let passes: [(&metal::TextureRef, &metal::TextureRef, [f32; 2]); 3] = [
+            (source_texture, ping_texture, [0.0, 0.0]),
+            (ping_texture, pong_texture, [1.0, 0.0]),
+            (pong_texture, ping_texture, [0.0, 1.0]),
+        ];
+        for (source, target, direction) in passes {
+            let render_pass_descriptor = metal::RenderPassDescriptor::new();
+            let color_attachment = render_pass_descriptor
+                .color_attachments()
+                .object_at(0)
+                .unwrap();
+            color_attachment.set_texture(Some(target));
+            color_attachment.set_load_action(metal::MTLLoadAction::DontCare);
+            color_attachment.set_store_action(metal::MTLStoreAction::Store);
+
+            let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+            command_encoder.set_render_pipeline_state(&self.backdrop_blur_pass_pipeline_state);
+            command_encoder.set_vertex_buffer(
+                BackdropBlurPassInputIndex::Vertices as u64,
+                Some(&self.unit_vertices),
+                0,
+            );
+            let params = BackdropBlurPassParams {
+                src_texel_size: [
+                    1.0 / source.width() as f32,
+                    1.0 / source.height() as f32,
+                ],
+                direction,
+                sigma,
+                taps,
+                pad: [0.0; 2],
+            };
+            command_encoder.set_fragment_bytes(
+                BackdropBlurPassInputIndex::Params as u64,
+                mem::size_of_val(&params) as u64,
+                &params as *const BackdropBlurPassParams as *const _,
+            );
+            command_encoder.set_fragment_texture(
+                BackdropBlurPassInputIndex::SourceTexture as u64,
+                Some(source),
+            );
+            command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+            command_encoder.end_encoding();
+        }
+        true
+    }
+
+    /// Composites the blurred backdrop over the framebuffer, masked by the
+    /// primitive's rounded corners.
+    fn draw_backdrop_blur(
+        &self,
+        blur: &BackdropBlur,
+        instance_buffer: &mut InstanceBuffer,
+        instance_offset: &mut usize,
+        viewport_size: Size<DevicePixels>,
+        command_encoder: &metal::RenderCommandEncoderRef,
+    ) -> bool {
+        let Some(ping_texture) = &self.blur_ping_texture else {
+            return false;
+        };
+
+        align_offset(instance_offset);
+        let blur_bytes_len = mem::size_of::<BackdropBlur>();
+        let next_offset = *instance_offset + blur_bytes_len;
+        if next_offset > instance_buffer.size {
+            return false;
+        }
+
+        command_encoder.set_render_pipeline_state(&self.backdrop_blur_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            BackdropBlurInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_vertex_buffer(
+            BackdropBlurInputIndex::Blurs as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_fragment_buffer(
+            BackdropBlurInputIndex::Blurs as u64,
+            Some(&instance_buffer.metal_buffer),
+            *instance_offset as u64,
+        );
+        command_encoder.set_vertex_bytes(
+            BackdropBlurInputIndex::ViewportSize as u64,
+            mem::size_of_val(&viewport_size) as u64,
+            &viewport_size as *const Size<DevicePixels> as *const _,
+        );
+        command_encoder.set_fragment_texture(
+            BackdropBlurInputIndex::BlurredTexture as u64,
+            Some(ping_texture),
+        );
+
+        let buffer_contents =
+            unsafe { (instance_buffer.metal_buffer.contents() as *mut u8).add(*instance_offset) };
+        unsafe {
+            ptr::copy_nonoverlapping(
+                blur as *const BackdropBlur as *const u8,
+                buffer_contents,
+                blur_bytes_len,
+            );
+        }
+
+        command_encoder.draw_primitives_instanced(metal::MTLPrimitiveType::Triangle, 0, 6, 1);
+        *instance_offset = next_offset;
+        true
     }
 
     fn draw_paths_to_intermediate(
@@ -1662,6 +1871,35 @@ fn build_path_sprite_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+fn build_blur_pass_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    label: &str,
+    vertex_fn_name: &str,
+    fragment_fn_name: &str,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(vertex_fn_name, None)
+        .expect("error locating vertex function");
+    let fragment_fn = library
+        .get_function(fragment_fn_name, None)
+        .expect("error locating fragment function");
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    // The blur passes overwrite the whole target; blending stays disabled.
+    color_attachment.set_blending_enabled(false);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
 fn build_path_rasterization_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
@@ -1750,6 +1988,35 @@ enum SurfaceInputIndex {
 enum PathRasterizationInputIndex {
     Vertices = 0,
     ViewportSize = 1,
+}
+
+#[repr(C)]
+enum BackdropBlurPassInputIndex {
+    Vertices = 0,
+    Params = 1,
+    SourceTexture = 2,
+}
+
+#[repr(C)]
+enum BackdropBlurInputIndex {
+    Vertices = 0,
+    Blurs = 1,
+    ViewportSize = 2,
+    BlurredTexture = 3,
+}
+
+/// Parameters for one downsample/blur pass over the captured framebuffer.
+#[repr(C)]
+pub struct BackdropBlurPassParams {
+    /// `1.0 / size` of the texture being sampled.
+    pub src_texel_size: [f32; 2],
+    /// Blur direction in texels; `(0, 0)` performs a plain downsampling blit.
+    pub direction: [f32; 2],
+    /// Gaussian sigma in downsampled texels.
+    pub sigma: f32,
+    /// Number of taps on each side of the center sample.
+    pub taps: f32,
+    pub pad: [f32; 2],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

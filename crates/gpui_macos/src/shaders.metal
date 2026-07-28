@@ -1277,3 +1277,113 @@ float4 fill_color(Background background,
 
   return color;
 }
+
+/*
+**
+**              Backdrop blur
+**
+*/
+
+struct BackdropBlurPassVertexOutput {
+  float4 position [[position]];
+  float2 texture_coords;
+};
+
+vertex BackdropBlurPassVertexOutput backdrop_blur_pass_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices
+    [[buffer(BackdropBlurPassInputIndex_Vertices)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float2 device_position =
+      unit_vertex * float2(2., -2.) + float2(-1., 1.);
+  return BackdropBlurPassVertexOutput{float4(device_position, 0., 1.),
+                                      unit_vertex};
+}
+
+fragment float4 backdrop_blur_pass_fragment(
+    BackdropBlurPassVertexOutput input [[stage_in]],
+    constant BackdropBlurPassParams *params
+    [[buffer(BackdropBlurPassInputIndex_Params)]],
+    texture2d<float> source_texture
+    [[texture(BackdropBlurPassInputIndex_SourceTexture)]]) {
+  constexpr sampler source_sampler(mag_filter::linear, min_filter::linear,
+                                   address::clamp_to_edge);
+  float2 direction =
+      float2(params->direction[0], params->direction[1]);
+  if (params->sigma < 0.05 || dot(direction, direction) == 0.) {
+    return source_texture.sample(source_sampler, input.texture_coords);
+  }
+  float2 step_size =
+      direction * float2(params->src_texel_size[0], params->src_texel_size[1]);
+  float4 sum = source_texture.sample(source_sampler, input.texture_coords);
+  float total = 1.;
+  int taps = int(params->taps);
+  for (int i = 1; i <= taps; i++) {
+    float weight =
+        exp(-float(i * i) / (2. * params->sigma * params->sigma));
+    sum += (source_texture.sample(source_sampler,
+                                  input.texture_coords + step_size * float(i)) +
+            source_texture.sample(
+                source_sampler, input.texture_coords - step_size * float(i))) *
+           weight;
+    total += 2. * weight;
+  }
+  return sum / total;
+}
+
+struct BackdropBlurVertexOutput {
+  float4 position [[position]];
+  float2 texture_coords;
+  uint blur_id [[flat]];
+  float clip_distance [[clip_distance]][4];
+};
+
+struct BackdropBlurFragmentInput {
+  float4 position [[position]];
+  float2 texture_coords;
+  uint blur_id [[flat]];
+};
+
+vertex BackdropBlurVertexOutput backdrop_blur_vertex(
+    uint unit_vertex_id [[vertex_id]], uint blur_id [[instance_id]],
+    constant float2 *unit_vertices [[buffer(BackdropBlurInputIndex_Vertices)]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
+    constant Size_DevicePixels *viewport_size
+    [[buffer(BackdropBlurInputIndex_ViewportSize)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  BackdropBlur blur = blurs[blur_id];
+  float4 device_position =
+      to_device_position(unit_vertex, blur.bounds, viewport_size);
+  float4 clip_distance = distance_from_clip_rect(unit_vertex, blur.bounds,
+                                                 blur.content_mask.bounds);
+  float2 screen_position =
+      float2(blur.bounds.origin.x, blur.bounds.origin.y) +
+      unit_vertex * float2(blur.bounds.size.width, blur.bounds.size.height);
+  float2 texture_coords =
+      screen_position / float2(viewport_size->width, viewport_size->height);
+  return BackdropBlurVertexOutput{
+      device_position,
+      texture_coords,
+      blur_id,
+      {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
+}
+
+fragment float4 backdrop_blur_fragment(
+    BackdropBlurFragmentInput input [[stage_in]],
+    constant BackdropBlur *blurs [[buffer(BackdropBlurInputIndex_Blurs)]],
+    texture2d<float> blurred_texture
+    [[texture(BackdropBlurInputIndex_BlurredTexture)]]) {
+  BackdropBlur blur = blurs[input.blur_id];
+  constexpr sampler blurred_sampler(mag_filter::linear, min_filter::linear,
+                                    address::clamp_to_edge);
+  float4 color = blurred_texture.sample(blurred_sampler, input.texture_coords);
+
+  float grayscale =
+      0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b;
+  color.rgb = mix(float3(grayscale), color.rgb, blur.saturation);
+
+  float distance =
+      quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
+  float alpha = saturate(0.5 - distance);
+  return float4(color.rgb * alpha, alpha);
+}

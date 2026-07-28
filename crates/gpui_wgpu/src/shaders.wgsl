@@ -1362,3 +1362,109 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// --- backdrop blur ---
+
+struct BackdropBlurPassParams {
+    src_texel_size: vec2<f32>,
+    // Blur direction in texels; vec2(0,0) = downsample blit only
+    direction: vec2<f32>,
+    sigma: f32,
+    taps: f32,
+    pad: vec2<f32>,
+}
+
+@group(1) @binding(0) var<storage, read> b_blur_pass_params: array<BackdropBlurPassParams>;
+@group(1) @binding(1) var t_blur_source: texture_2d<f32>;
+@group(1) @binding(2) var s_blur_source: sampler;
+
+struct BackdropBlurPassVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs_backdrop_blur_pass(
+    @builtin(vertex_index) vertex_id: u32,
+) -> BackdropBlurPassVarying {
+    let unit = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    var out: BackdropBlurPassVarying;
+    out.position = vec4<f32>(unit * vec2<f32>(2., -2.) + vec2<f32>(-1., 1.), 0., 1.);
+    out.uv = unit;
+    return out;
+}
+
+@fragment
+fn fs_backdrop_blur_pass(input: BackdropBlurPassVarying) -> @location(0) vec4<f32> {
+    let p = b_blur_pass_params[0];
+    if (p.sigma < 0.05 || dot(p.direction, p.direction) == 0.0) {
+        return textureSample(t_blur_source, s_blur_source, input.uv);
+    }
+    let step = p.direction * p.src_texel_size;
+    var sum = textureSample(t_blur_source, s_blur_source, input.uv);
+    var total: f32 = 1.0;
+    let taps = i32(p.taps);
+    for (var i = 1; i <= taps; i++) {
+        let weight = exp(-f32(i * i) / (2.0 * p.sigma * p.sigma));
+        sum += (textureSample(t_blur_source, s_blur_source, input.uv + step * f32(i)) +
+                textureSample(t_blur_source, s_blur_source, input.uv - step * f32(i))) * weight;
+        total += 2.0 * weight;
+    }
+    return sum / total;
+}
+
+// Composite the blurred result back onto the framebuffer, masked by
+// the primitive's rounded corners and saturation.
+struct BackdropBlur {
+    order: u32,
+    blur_radius: f32,
+    bounds: Bounds,
+    content_mask: Bounds,
+    corner_radii: Corners,
+    saturation: f32,
+    pad: u32,
+}
+
+@group(1) @binding(0) var<storage, read> b_backdrop_blurs: array<BackdropBlur>;
+// group(1) binding 1 = t_sprite, binding 2 = s_sprite (reuse instances_with_texture layout)
+
+struct BackdropBlurVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) blur_id: u32,
+    @location(1) uv: vec2<f32>,
+    @location(2) clip_distances: vec4<f32>,
+}
+
+@vertex
+fn vs_backdrop_blur(
+    @builtin(vertex_index) vertex_id: u32,
+    @builtin(instance_index) instance_id: u32,
+) -> BackdropBlurVarying {
+    let unit = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let blur = b_backdrop_blurs[instance_id];
+    let screen_pos = blur.bounds.origin + unit * blur.bounds.size;
+    var out: BackdropBlurVarying;
+    out.position = to_device_position(unit, blur.bounds);
+    out.blur_id = instance_id;
+    out.uv = screen_pos / globals.viewport_size;
+    out.clip_distances = distance_from_clip_rect(unit, blur.bounds, blur.content_mask);
+    return out;
+}
+
+@fragment
+fn fs_backdrop_blur(input: BackdropBlurVarying) -> @location(0) vec4<f32> {
+    if (any(input.clip_distances < vec4<f32>(0.0))) {
+        return vec4<f32>(0.0);
+    }
+    let blur = b_backdrop_blurs[input.blur_id];
+    var color = textureSample(t_sprite, s_sprite, input.uv);
+
+    // Saturation adjustment
+    let lum = dot(color.rgb, GRAYSCALE_FACTORS);
+    color = vec4<f32>(mix(vec3<f32>(lum), color.rgb, blur.saturation), color.a);
+
+    // Rounded-corner mask
+    let dist = quad_sdf(input.position.xy, blur.bounds, blur.corner_radii);
+    let alpha = saturate(0.5 - dist);
+    return blend_color(color, alpha);
+}

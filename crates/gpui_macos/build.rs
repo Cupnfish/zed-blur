@@ -62,6 +62,10 @@ mod macos_build {
             "SurfaceInputIndex".into(),
             "SurfaceBounds".into(),
             "TransformationMatrix".into(),
+            "BackdropBlur".into(),
+            "BackdropBlurInputIndex".into(),
+            "BackdropBlurPassInputIndex".into(),
+            "BackdropBlurPassParams".into(),
         ]);
         config.no_includes = true;
         config.enumeration.prefix_with_name = true;
