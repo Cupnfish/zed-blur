@@ -1387,3 +1387,92 @@ fragment float4 backdrop_blur_fragment(
   float alpha = saturate(0.5 - distance);
   return float4(color.rgb * alpha, alpha);
 }
+
+/*
+**
+**              Theme transition
+**
+** Composites stable snapshots of the old and incoming frames through the
+** same rectangle, circle, and circle-blur reveals as the DirectX backend.
+**
+*/
+
+struct ThemeTransitionVertexOutput {
+  float4 position [[position]];
+  float2 texture_coords;
+};
+
+vertex ThemeTransitionVertexOutput theme_transition_vertex(
+    uint unit_vertex_id [[vertex_id]],
+    constant float2 *unit_vertices
+    [[buffer(ThemeTransitionInputIndex_Vertices)]]) {
+  float2 unit_vertex = unit_vertices[unit_vertex_id];
+  float2 device_position =
+      unit_vertex * float2(2., -2.) + float2(-1., 1.);
+  return ThemeTransitionVertexOutput{float4(device_position, 0., 1.),
+                                     unit_vertex};
+}
+
+fragment float4 theme_transition_fragment(
+    ThemeTransitionVertexOutput input [[stage_in]],
+    constant TransitionParams *params
+    [[buffer(ThemeTransitionInputIndex_Params)]],
+    texture2d<float> snapshot_texture
+    [[texture(ThemeTransitionInputIndex_SnapshotTexture)]],
+    texture2d<float> incoming_texture
+    [[texture(ThemeTransitionInputIndex_IncomingTexture)]],
+    texture2d<float> medium_blur_texture
+    [[texture(ThemeTransitionInputIndex_MediumBlurTexture)]],
+    texture2d<float> full_blur_texture
+    [[texture(ThemeTransitionInputIndex_FullBlurTexture)]]) {
+  constexpr sampler transition_sampler(mag_filter::linear, min_filter::linear,
+                                       address::clamp_to_edge);
+  float4 old_color =
+      snapshot_texture.sample(transition_sampler, input.texture_coords);
+  float4 sharp_incoming =
+      incoming_texture.sample(transition_sampler, input.texture_coords);
+  float4 incoming_color = sharp_incoming;
+
+  if (params->style > 1.5) {
+    float4 medium_blur =
+        medium_blur_texture.sample(transition_sampler, input.texture_coords);
+    float4 full_blur =
+        full_blur_texture.sample(transition_sampler, input.texture_coords);
+    if (params->blur_progress < 0.5) {
+      incoming_color =
+          mix(full_blur, medium_blur, params->blur_progress * 2.);
+    } else {
+      incoming_color = mix(medium_blur, sharp_incoming,
+                           (params->blur_progress - 0.5) * 2.);
+    }
+  }
+
+  float mask;
+  if (params->style > 0.5) {
+    float radius = params->max_radius * params->progress;
+    float2 origin = float2(params->origin[0], params->origin[1]);
+    float distance_from_origin = distance(input.position.xy, origin);
+    mask = 1. - smoothstep(radius - params->edge_softness,
+                           radius + params->edge_softness,
+                           distance_from_origin);
+  } else {
+    float4 insets =
+        float4(params->rectangle_insets[0], params->rectangle_insets[1],
+               params->rectangle_insets[2], params->rectangle_insets[3]) *
+        (1. - params->progress);
+    float2 minimum = float2(insets.w, insets.x);
+    float2 maximum = float2(1. - insets.y, 1. - insets.z);
+    float2 outside = max(max(minimum - input.texture_coords,
+                             input.texture_coords - maximum),
+                         0.);
+    float2 viewport_size =
+        float2(snapshot_texture.get_width(), snapshot_texture.get_height());
+    float outside_distance = length(outside * viewport_size);
+    mask = 1. - smoothstep(0., params->edge_softness, outside_distance);
+  }
+  if (params->progress <= 0.00001) {
+    mask = 0.;
+  }
+
+  return mix(old_color, incoming_color, mask);
+}

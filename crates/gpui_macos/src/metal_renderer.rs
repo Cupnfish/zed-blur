@@ -9,7 +9,7 @@ use cocoa::{
 use gpui::{
     AtlasTextureId, BackdropBlur, Background, Bounds, ContentMask, DevicePixels, MonochromeSprite,
     PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad, ScaledPixels, Scene, Shadow,
-    Size, Surface, Underline, point, size,
+    Size, Surface, TransitionParams, Underline, point, size,
 };
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
@@ -41,6 +41,8 @@ const SHADERS_SOURCE_FILE: &str = include_str!(concat!(env!("OUT_DIR"), "/stitch
 const PATH_SAMPLE_COUNT: u32 = 4;
 // Backdrop blurs run on a downsampled copy of the framebuffer; higher is faster.
 const BLUR_DOWNSAMPLE: u32 = 2;
+// Theme-transition blur is precomputed once and can use a smaller working set.
+const THEME_BLUR_DOWNSAMPLE: u32 = 4;
 
 pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
 pub(crate) type Renderer = MetalRenderer;
@@ -129,6 +131,7 @@ pub(crate) struct MetalRenderer {
     surfaces_pipeline_state: metal::RenderPipelineState,
     backdrop_blur_pass_pipeline_state: metal::RenderPipelineState,
     backdrop_blur_pipeline_state: metal::RenderPipelineState,
+    theme_transition_pipeline_state: metal::RenderPipelineState,
     unit_vertices: metal::Buffer,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
@@ -141,10 +144,69 @@ pub(crate) struct MetalRenderer {
     /// `BackdropBlur` primitives.
     blur_ping_texture: Option<metal::Texture>,
     blur_pong_texture: Option<metal::Texture>,
+    /// Stable old/incoming snapshots and one-time CircleBlur intermediates.
+    theme_transition_resources: Option<ThemeTransitionResources>,
+    transition_incoming_captured: bool,
+    transition_blur_ready: bool,
+    presented_frame_valid: bool,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+/// Full-size stable snapshots plus downsampled CircleBlur working textures.
+struct ThemeTransitionResources {
+    presented_texture: metal::Texture,
+    snapshot_texture: metal::Texture,
+    incoming_texture: metal::Texture,
+    blur_ping_texture: metal::Texture,
+    blur_pong_texture: metal::Texture,
+    medium_blur_texture: metal::Texture,
+    full_blur_texture: metal::Texture,
+}
+
+impl ThemeTransitionResources {
+    fn new(device: &metal::DeviceRef, size: Size<DevicePixels>) -> Self {
+        let full_descriptor = metal::TextureDescriptor::new();
+        full_descriptor.set_width(size.width.0 as u64);
+        full_descriptor.set_height(size.height.0 as u64);
+        full_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        full_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        full_descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+
+        let blur_descriptor = metal::TextureDescriptor::new();
+        blur_descriptor.set_width(
+            (size.width.0 as u64)
+                .div_ceil(THEME_BLUR_DOWNSAMPLE as u64)
+                .max(1),
+        );
+        blur_descriptor.set_height(
+            (size.height.0 as u64)
+                .div_ceil(THEME_BLUR_DOWNSAMPLE as u64)
+                .max(1),
+        );
+        blur_descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        blur_descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        blur_descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+
+        Self {
+            presented_texture: device.new_texture(&full_descriptor),
+            snapshot_texture: device.new_texture(&full_descriptor),
+            incoming_texture: device.new_texture(&full_descriptor),
+            blur_ping_texture: device.new_texture(&blur_descriptor),
+            blur_pong_texture: device.new_texture(&blur_descriptor),
+            medium_blur_texture: device.new_texture(&blur_descriptor),
+            full_blur_texture: device.new_texture(&blur_descriptor),
+        }
+    }
+
+    fn matches_size(&self, size: Size<DevicePixels>) -> bool {
+        self.presented_texture.width() == size.width.0 as u64
+            && self.presented_texture.height() == size.height.0 as u64
+    }
 }
 
 #[repr(C)]
@@ -348,6 +410,14 @@ impl MetalRenderer {
             "backdrop_blur_fragment",
             MTLPixelFormat::BGRA8Unorm,
         );
+        let theme_transition_pipeline_state = build_blur_pass_pipeline_state(
+            &device,
+            &library,
+            "theme_transition",
+            "theme_transition_vertex",
+            "theme_transition_fragment",
+            MTLPixelFormat::BGRA8Unorm,
+        );
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
@@ -372,6 +442,7 @@ impl MetalRenderer {
             surfaces_pipeline_state,
             backdrop_blur_pass_pipeline_state,
             backdrop_blur_pipeline_state,
+            theme_transition_pipeline_state,
             unit_vertices,
             instance_buffer_pool,
             sprite_atlas,
@@ -381,6 +452,10 @@ impl MetalRenderer {
             path_sample_count: PATH_SAMPLE_COUNT,
             blur_ping_texture: None,
             blur_pong_texture: None,
+            theme_transition_resources: None,
+            transition_incoming_captured: false,
+            transition_blur_ready: false,
+            presented_frame_valid: false,
             #[cfg(any(test, feature = "test-support"))]
             headless_render_target: None,
         }
@@ -425,6 +500,7 @@ impl MetalRenderer {
     }
 
     fn update_path_intermediate_textures(&mut self, size: Size<DevicePixels>) {
+        self.ensure_theme_transition_resources(size);
         // We are uncertain when this happens, but sometimes size can be 0 here. Most likely before
         // the layout pass on window creation. Zero-sized texture creation causes SIGABRT.
         // https://github.com/zed-industries/zed/issues/36229
@@ -465,7 +541,11 @@ impl MetalRenderer {
 
         // Backdrop blurs run on a downsampled copy of the framebuffer.
         let blur_descriptor = metal::TextureDescriptor::new();
-        blur_descriptor.set_width((size.width.0 as u64).div_ceil(BLUR_DOWNSAMPLE as u64).max(1));
+        blur_descriptor.set_width(
+            (size.width.0 as u64)
+                .div_ceil(BLUR_DOWNSAMPLE as u64)
+                .max(1),
+        );
         blur_descriptor.set_height(
             (size.height.0 as u64)
                 .div_ceil(BLUR_DOWNSAMPLE as u64)
@@ -479,6 +559,29 @@ impl MetalRenderer {
         self.blur_pong_texture = Some(self.device.new_texture(&blur_descriptor));
     }
 
+    fn ensure_theme_transition_resources(&mut self, size: Size<DevicePixels>) {
+        if size.width.0 <= 0 || size.height.0 <= 0 {
+            self.theme_transition_resources = None;
+            self.transition_incoming_captured = false;
+            self.transition_blur_ready = false;
+            self.presented_frame_valid = false;
+            return;
+        }
+        // Preserve transition snapshots across same-size headless renders and
+        // ordinary scale-factor callbacks. Recreate only when geometry changes.
+        if self
+            .theme_transition_resources
+            .as_ref()
+            .is_none_or(|resources| !resources.matches_size(size))
+        {
+            self.theme_transition_resources =
+                Some(ThemeTransitionResources::new(&self.device, size));
+            self.transition_incoming_captured = false;
+            self.transition_blur_ready = false;
+            self.presented_frame_valid = false;
+        }
+    }
+
     pub fn update_transparency(&mut self, transparent: bool) {
         self.opaque = !transparent;
         if let Some(layer) = &self.layer {
@@ -488,6 +591,30 @@ impl MetalRenderer {
 
     pub fn destroy(&self) {
         // nothing to do
+    }
+
+    /// Capture the last complete non-transition frame as the old side of the
+    /// next theme transition. Command buffers on one Metal queue execute in
+    /// submission order, so the following transition draw observes this copy
+    /// without blocking the main thread for GPU completion.
+    pub fn capture_theme_transition_snapshot(&mut self) -> bool {
+        if !self.presented_frame_valid {
+            return false;
+        }
+        let Some(resources) = self.theme_transition_resources.as_ref() else {
+            return false;
+        };
+
+        let command_buffer = self.command_queue.new_command_buffer();
+        Self::copy_texture(
+            &resources.presented_texture,
+            &resources.snapshot_texture,
+            command_buffer,
+        );
+        command_buffer.commit();
+        self.transition_incoming_captured = false;
+        self.transition_blur_ready = false;
+        true
     }
 
     pub fn draw(&mut self, scene: &Scene) {
@@ -505,6 +632,7 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        self.ensure_theme_transition_resources(viewport_size);
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
@@ -526,6 +654,12 @@ impl MetalRenderer {
 
             match command_buffer {
                 Ok(command_buffer) => {
+                    self.encode_theme_transition_frame(
+                        scene,
+                        drawable.texture(),
+                        &command_buffer,
+                        viewport_size,
+                    );
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
                     let block = ConcreteBlock::new(move |_| {
@@ -584,6 +718,7 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        self.ensure_theme_transition_resources(viewport_size);
         let drawable = layer
             .next_drawable()
             .ok_or_else(|| anyhow::anyhow!("Failed to get drawable for render_to_image"))?;
@@ -599,6 +734,12 @@ impl MetalRenderer {
 
             match command_buffer {
                 Ok(command_buffer) => {
+                    self.encode_theme_transition_frame(
+                        scene,
+                        drawable.texture(),
+                        &command_buffer,
+                        viewport_size,
+                    );
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
                     let block = ConcreteBlock::new(move |_| {
@@ -705,6 +846,12 @@ impl MetalRenderer {
 
             match command_buffer {
                 Ok(command_buffer) => {
+                    self.encode_theme_transition_frame(
+                        scene,
+                        &target_texture,
+                        &command_buffer,
+                        size,
+                    );
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
                     let block = ConcreteBlock::new(move |_| {
@@ -827,6 +974,12 @@ impl MetalRenderer {
 
             match command_buffer {
                 Ok(command_buffer) => {
+                    self.encode_theme_transition_frame(
+                        scene,
+                        &target_texture,
+                        &command_buffer,
+                        size,
+                    );
                     let instance_buffer_pool = self.instance_buffer_pool.clone();
                     let instance_buffer = Cell::new(Some(instance_buffer));
                     let block = ConcreteBlock::new(move |_| {
@@ -860,6 +1013,189 @@ impl MetalRenderer {
                 }
             }
         }
+    }
+
+    fn copy_texture(
+        source: &metal::TextureRef,
+        destination: &metal::TextureRef,
+        command_buffer: &metal::CommandBufferRef,
+    ) {
+        debug_assert_eq!(source.width(), destination.width());
+        debug_assert_eq!(source.height(), destination.height());
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.copy_from_texture(
+            source,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLSize {
+                width: source.width(),
+                height: source.height(),
+                depth: 1,
+            },
+            destination,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+        );
+        blit.end_encoding();
+    }
+
+    fn encode_theme_transition_frame(
+        &mut self,
+        scene: &Scene,
+        target_texture: &metal::TextureRef,
+        command_buffer: &metal::CommandBufferRef,
+        viewport_size: Size<DevicePixels>,
+    ) {
+        let Some(resources) = self.theme_transition_resources.as_ref() else {
+            self.presented_frame_valid = false;
+            return;
+        };
+        if resources.presented_texture.width() != target_texture.width()
+            || resources.presented_texture.height() != target_texture.height()
+        {
+            self.presented_frame_valid = false;
+            return;
+        }
+
+        let Some(params) = scene.transition else {
+            // Retain exactly the complete frame that is about to be presented.
+            // A CAMetalLayer drawable is not a stable last-presented buffer.
+            Self::copy_texture(target_texture, &resources.presented_texture, command_buffer);
+            self.presented_frame_valid = true;
+            return;
+        };
+
+        if !self.transition_incoming_captured {
+            // Capture the first complete new-theme frame once. Later scene
+            // draws may continue changing underneath the stable transition.
+            Self::copy_texture(target_texture, &resources.incoming_texture, command_buffer);
+            self.transition_incoming_captured = true;
+        }
+
+        if params.style > 1.5 && !self.transition_blur_ready {
+            let full_sigma = (params.blur_radius / (2.0 * THEME_BLUR_DOWNSAMPLE as f32)).max(0.0);
+            let medium_sigma = full_sigma * 0.5;
+            let passes: [(&metal::TextureRef, &metal::TextureRef, [f32; 2], f32); 5] = [
+                (
+                    &resources.incoming_texture,
+                    &resources.blur_ping_texture,
+                    [0.0, 0.0],
+                    0.0,
+                ),
+                (
+                    &resources.blur_ping_texture,
+                    &resources.blur_pong_texture,
+                    [1.0, 0.0],
+                    full_sigma,
+                ),
+                (
+                    &resources.blur_pong_texture,
+                    &resources.full_blur_texture,
+                    [0.0, 1.0],
+                    full_sigma,
+                ),
+                (
+                    &resources.blur_ping_texture,
+                    &resources.blur_pong_texture,
+                    [1.0, 0.0],
+                    medium_sigma,
+                ),
+                (
+                    &resources.blur_pong_texture,
+                    &resources.medium_blur_texture,
+                    [0.0, 1.0],
+                    medium_sigma,
+                ),
+            ];
+            for (source, target, direction, sigma) in passes {
+                self.encode_blur_pass(source, target, direction, sigma, command_buffer);
+            }
+            self.transition_blur_ready = true;
+        }
+
+        let command_encoder = new_command_encoder_for_texture(
+            command_buffer,
+            target_texture,
+            viewport_size,
+            |color_attachment| {
+                color_attachment.set_load_action(metal::MTLLoadAction::Load);
+            },
+        );
+        command_encoder.set_render_pipeline_state(&self.theme_transition_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            ThemeTransitionInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        command_encoder.set_fragment_bytes(
+            ThemeTransitionInputIndex::Params as u64,
+            mem::size_of_val(&params) as u64,
+            &params as *const TransitionParams as *const _,
+        );
+        command_encoder.set_fragment_texture(
+            ThemeTransitionInputIndex::SnapshotTexture as u64,
+            Some(&resources.snapshot_texture),
+        );
+        command_encoder.set_fragment_texture(
+            ThemeTransitionInputIndex::IncomingTexture as u64,
+            Some(&resources.incoming_texture),
+        );
+        command_encoder.set_fragment_texture(
+            ThemeTransitionInputIndex::MediumBlurTexture as u64,
+            Some(&resources.medium_blur_texture),
+        );
+        command_encoder.set_fragment_texture(
+            ThemeTransitionInputIndex::FullBlurTexture as u64,
+            Some(&resources.full_blur_texture),
+        );
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        command_encoder.end_encoding();
+    }
+
+    fn encode_blur_pass(
+        &self,
+        source: &metal::TextureRef,
+        target: &metal::TextureRef,
+        direction: [f32; 2],
+        sigma: f32,
+        command_buffer: &metal::CommandBufferRef,
+    ) {
+        let render_pass_descriptor = metal::RenderPassDescriptor::new();
+        let color_attachment = render_pass_descriptor
+            .color_attachments()
+            .object_at(0)
+            .unwrap();
+        color_attachment.set_texture(Some(target));
+        color_attachment.set_load_action(metal::MTLLoadAction::DontCare);
+        color_attachment.set_store_action(metal::MTLStoreAction::Store);
+
+        let command_encoder = command_buffer.new_render_command_encoder(render_pass_descriptor);
+        command_encoder.set_render_pipeline_state(&self.backdrop_blur_pass_pipeline_state);
+        command_encoder.set_vertex_buffer(
+            BackdropBlurPassInputIndex::Vertices as u64,
+            Some(&self.unit_vertices),
+            0,
+        );
+        let params = BackdropBlurPassParams {
+            src_texel_size: [1.0 / source.width() as f32, 1.0 / source.height() as f32],
+            direction,
+            sigma,
+            taps: (2.5 * sigma).ceil().clamp(0.0, 64.0),
+            pad: [0.0; 2],
+        };
+        command_encoder.set_fragment_bytes(
+            BackdropBlurPassInputIndex::Params as u64,
+            mem::size_of_val(&params) as u64,
+            &params as *const BackdropBlurPassParams as *const _,
+        );
+        command_encoder.set_fragment_texture(
+            BackdropBlurPassInputIndex::SourceTexture as u64,
+            Some(source),
+        );
+        command_encoder.draw_primitives(metal::MTLPrimitiveType::Triangle, 0, 6);
+        command_encoder.end_encoding();
     }
 
     fn draw_primitives(
@@ -1081,10 +1417,7 @@ impl MetalRenderer {
                 0,
             );
             let params = BackdropBlurPassParams {
-                src_texel_size: [
-                    1.0 / source.width() as f32,
-                    1.0 / source.height() as f32,
-                ],
+                src_texel_size: [1.0 / source.width() as f32, 1.0 / source.height() as f32],
                 direction,
                 sigma,
                 taps,
@@ -2005,6 +2338,18 @@ enum BackdropBlurInputIndex {
     BlurredTexture = 3,
 }
 
+#[repr(C)]
+enum ThemeTransitionInputIndex {
+    Vertices = 0,
+    Params = 1,
+    SnapshotTexture = 2,
+    IncomingTexture = 3,
+    MediumBlurTexture = 4,
+    FullBlurTexture = 5,
+}
+
+const _: () = assert!(mem::size_of::<TransitionParams>() == 48);
+
 /// Parameters for one downsample/blur pass over the captured framebuffer.
 #[repr(C)]
 pub struct BackdropBlurPassParams {
@@ -2062,5 +2407,149 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InstanceBufferPool, MetalRenderer};
+    use gpui::{
+        Bounds, ContentMask, DevicePixels, Quad, ScaledPixels, Scene, Size, TransitionParams,
+        bounds, point, rgb, size,
+    };
+    use image::RgbaImage;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+
+    const TEST_EXTENT: i32 = 64;
+
+    fn test_size() -> Size<DevicePixels> {
+        size(TEST_EXTENT.into(), TEST_EXTENT.into())
+    }
+
+    fn quad_bounds(x: i32, y: i32, width: i32, height: i32) -> Bounds<ScaledPixels> {
+        bounds(
+            point((x as f32).into(), (y as f32).into()),
+            size((width as f32).into(), (height as f32).into()),
+        )
+    }
+
+    fn solid_scene(color: u32, transition: Option<TransitionParams>) -> Scene {
+        let mut scene = Scene::default();
+        let bounds = quad_bounds(0, 0, TEST_EXTENT, TEST_EXTENT);
+        scene.insert_primitive(Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: rgb(color).into(),
+            ..Default::default()
+        });
+        scene.transition = transition;
+        scene.finish();
+        scene
+    }
+
+    fn checker_scene(transition: Option<TransitionParams>) -> Scene {
+        let mut scene = Scene::default();
+        const TILE: i32 = 4;
+        for y in 0..TEST_EXTENT / TILE {
+            for x in 0..TEST_EXTENT / TILE {
+                let bounds = quad_bounds(x * TILE, y * TILE, TILE, TILE);
+                scene.insert_primitive(Quad {
+                    bounds,
+                    content_mask: ContentMask { bounds },
+                    background: rgb(if (x + y) % 2 == 0 { 0xffffff } else { 0x000000 }).into(),
+                    ..Default::default()
+                });
+            }
+        }
+        scene.transition = transition;
+        scene.finish();
+        scene
+    }
+
+    fn transition_params(style: f32, progress: f32) -> TransitionParams {
+        TransitionParams {
+            origin: [TEST_EXTENT as f32 * 0.5; 2],
+            max_radius: TEST_EXTENT as f32,
+            progress,
+            rectangle_insets: [0.0; 4],
+            blur_progress: progress,
+            edge_softness: 0.75,
+            blur_radius: 16.0,
+            style,
+        }
+    }
+
+    fn new_headless_renderer() -> MetalRenderer {
+        MetalRenderer::new_headless(Arc::new(Mutex::new(InstanceBufferPool::default())))
+    }
+
+    fn center_pixel(image: &RgbaImage) -> [u8; 4] {
+        image.get_pixel(image.width() / 2, image.height() / 2).0
+    }
+
+    #[test]
+    fn theme_transition_keeps_old_and_first_incoming_frames_stable() {
+        let mut renderer = new_headless_renderer();
+        let old = renderer
+            .render_scene_to_image(&solid_scene(0xff0000, None), test_size())
+            .unwrap();
+        assert!(renderer.capture_theme_transition_snapshot());
+
+        let start = renderer
+            .render_scene_to_image(
+                &solid_scene(0x00ff00, Some(transition_params(0.0, 0.0))),
+                test_size(),
+            )
+            .unwrap();
+        let end = renderer
+            .render_scene_to_image(
+                // The live scene changes after the first active frame. The
+                // transition must still reveal the stable green incoming copy.
+                &solid_scene(0x0000ff, Some(transition_params(0.0, 1.0))),
+                test_size(),
+            )
+            .unwrap();
+
+        let old = center_pixel(&old);
+        let start = center_pixel(&start);
+        let end = center_pixel(&end);
+        assert!(old[0] > 240 && old[1] < 15 && old[2] < 15);
+        assert_eq!(start, old);
+        assert!(end[0] < 15 && end[1] > 240 && end[2] < 15);
+    }
+
+    #[test]
+    fn circle_blur_is_visibly_distinct_from_circle() {
+        let mut renderer = new_headless_renderer();
+        renderer
+            .render_scene_to_image(&solid_scene(0x000000, None), test_size())
+            .unwrap();
+        assert!(renderer.capture_theme_transition_snapshot());
+
+        let circle = renderer
+            .render_scene_to_image(
+                &checker_scene(Some(transition_params(1.0, 0.9))),
+                test_size(),
+            )
+            .unwrap();
+        let mut blur_params = transition_params(2.0, 0.9);
+        blur_params.blur_progress = 0.0;
+        let circle_blur = renderer
+            .render_scene_to_image(&checker_scene(Some(blur_params)), test_size())
+            .unwrap();
+
+        let changed_pixels = circle
+            .pixels()
+            .zip(circle_blur.pixels())
+            .filter(|(sharp, blurred)| {
+                sharp
+                    .0
+                    .iter()
+                    .zip(blurred.0.iter())
+                    .any(|(left, right)| left.abs_diff(*right) > 8)
+            })
+            .count();
+        assert!(changed_pixels > (TEST_EXTENT * TEST_EXTENT / 4) as usize);
     }
 }

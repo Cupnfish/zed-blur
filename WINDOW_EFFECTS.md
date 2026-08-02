@@ -38,6 +38,7 @@ Added by the window-effects work (all additive):
 | `crates/gpui/src/platform.rs` | Four defaulted `PlatformWindow` methods for capability/snapshot capture and starting/stopping the platform animation frame source. Unsupported platforms retain the synchronous theme path. |
 | `crates/gpui/src/gpui.rs` | `mod window_effects` + re-export. |
 | `crates/gpui_windows/` | DirectX backend: stable old/incoming snapshots, one-time downsampled CircleBlur levels, and composite pipeline (`directx_renderer.rs`); `theme_transition` shaders (`shaders.hlsl`); fxc module entry (`build.rs`); per-window transition registration and fair vsync messages (`platform.rs`, `events.rs`, `window.rs`). |
+| `crates/gpui_macos/` | Metal backend: stable presented/old/incoming textures, one-time quarter-resolution CircleBlur levels, and the full-screen composite pass (`metal_renderer.rs` + `shaders.metal`); `MacWindow` capability/capture hooks reuse the existing per-window CVDisplayLink. |
 | `crates/theme_settings/src/theme_settings.rs` | `reload_theme` orchestration (the single theme choke point). |
 | `crates/workspace/src/modal_layer.rs` | Backdrop-blur consumer for modals with `fade_out_background`. |
 | `crates/theme_settings/Cargo.toml` | `futures` dep for the snapshot wait/timeout race. |
@@ -92,17 +93,14 @@ backdrop stays live; no per-modal state is needed.
   everything falls back to upstream behavior.
 - `GPUI_WINDOW_EFFECTS_TRACE=1` — logs state-machine transitions to stderr.
 
-## Phase 2 (not yet implemented)
+## Remaining platform work
 
-- Metal backend (macOS): snapshot via blit from the drawable texture
-  (`framebuffer_only(false)` is already set by the kept commit), composite
-  pass in `metal_renderer.rs` + `shaders.metal`, `cbindgen` export for
-  `TransitionParams`, `MacWindow` overrides.
 - wgpu backend (Linux/Web): gated on the existing `surface_supports_copy`
   flag; `copy_texture_to_texture` snapshot + WGSL port (near-verbatim from
   `theme_transition.wgsl` in pipit-window).
-- Smoke tests: macOS fullscreen + theme switch (`presents_with_transaction`
-  interaction), X11/Wayland with and without `COPY_SRC`.
+- Additional smoke tests: macOS fullscreen + theme switch
+  (`presents_with_transaction` interaction), X11/Wayland with and without
+  `COPY_SRC`.
 
-Until those land, `theme_transition_supported()` returns `false` on
-non-Windows platforms and the synchronous theme path applies.
+Until the wgpu backend lands, `theme_transition_supported()` remains `false`
+on Linux/Web and the synchronous theme path applies there.

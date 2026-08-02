@@ -66,6 +66,8 @@ mod macos_build {
             "BackdropBlurInputIndex".into(),
             "BackdropBlurPassInputIndex".into(),
             "BackdropBlurPassParams".into(),
+            "TransitionParams".into(),
+            "ThemeTransitionInputIndex".into(),
         ]);
         config.no_includes = true;
         config.enumeration.prefix_with_name = true;

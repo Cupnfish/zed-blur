@@ -1765,6 +1765,14 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
+    fn theme_transition_supported(&self) -> bool {
+        true
+    }
+
+    fn capture_theme_transition_snapshot(&self) -> bool {
+        self.0.lock().renderer.capture_theme_transition_snapshot()
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }
