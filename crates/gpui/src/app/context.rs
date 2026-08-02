@@ -458,6 +458,23 @@ impl<'a, T: 'static> Context<'a, T> {
         subscription
     }
 
+    /// Pins window-aware callbacks for this entity to `window`.
+    ///
+    /// By default, callbacks such as [`Self::subscribe_in`] use the most recently rendered
+    /// window that accessed the entity. Set an explicit context when the same entity is rendered
+    /// in multiple windows but interactions belong to one stable host.
+    pub fn set_window_context(&mut self, window: AnyWindowHandle) {
+        let entity_id = self.entity_id();
+        self.window_context_by_entity
+            .insert(entity_id, window.window_id());
+    }
+
+    /// Restores most-recently-rendered window inference for window-aware callbacks.
+    pub fn clear_window_context(&mut self) {
+        let entity_id = self.entity_id();
+        self.window_context_by_entity.remove(&entity_id);
+    }
+
     /// Register a callback to be invoked when the window is activated or deactivated.
     pub fn observe_window_activation(
         &self,

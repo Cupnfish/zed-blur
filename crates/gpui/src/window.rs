@@ -6664,6 +6664,19 @@ mod tests {
         child_bounds: Rc<Cell<Bounds<Pixels>>>,
     }
 
+    struct WindowContextEntity;
+
+    struct WindowContextRoot {
+        entity: crate::Entity<WindowContextEntity>,
+    }
+
+    impl Render for WindowContextRoot {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let _ = self.entity.read(cx);
+            div()
+        }
+    }
+
     impl Render for RootView {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let child_bounds = self.child_bounds.clone();
@@ -6791,6 +6804,52 @@ mod tests {
         cx.simulate_window_move_finished(window.into());
         cx.simulate_window_move_finished(window.into());
         assert_eq!(move_finished_count.get(), 2);
+    }
+
+    #[gpui::test]
+    fn explicit_entity_window_context_overrides_render_order(cx: &mut TestAppContext) {
+        let entity = cx.new(|_| WindowContextEntity);
+        let first = cx.add_window({
+            let entity = entity.clone();
+            move |_, _| WindowContextRoot { entity }
+        });
+        let second = cx.add_window({
+            let entity = entity.clone();
+            move |_, _| WindowContextRoot { entity }
+        });
+
+        cx.update_window(first.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        cx.update_window(second.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        entity.update(cx, |_, cx| cx.set_window_context(first.into()));
+
+        let routed_to_first = Rc::new(Cell::new(false));
+        entity
+            .downgrade()
+            .update_in(cx, {
+                let routed_to_first = routed_to_first.clone();
+                move |_, window, _| {
+                    routed_to_first.set(window.window_handle() == first.into());
+                }
+            })
+            .unwrap();
+        assert!(routed_to_first.get());
+
+        entity.update(cx, |_, cx| cx.clear_window_context());
+        let inferred_first = Rc::new(Cell::new(false));
+        cx.update_window(first.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        entity
+            .downgrade()
+            .update_in(cx, {
+                let inferred_first = inferred_first.clone();
+                move |_, window, _| {
+                    inferred_first.set(window.window_handle() == first.into());
+                }
+            })
+            .unwrap();
+        assert!(inferred_first.get());
     }
 
     struct FocusForwarder {

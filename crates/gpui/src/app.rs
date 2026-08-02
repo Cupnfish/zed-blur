@@ -738,6 +738,7 @@ pub struct App {
         FxHashMap<EntityId, FxHashMap<WindowId, WindowInvalidator>>,
     pub(crate) tracked_entities: FxHashMap<WindowId, FxHashSet<EntityId>>,
     pub(crate) current_window_by_entity: FxHashMap<EntityId, WindowId>,
+    pub(crate) window_context_by_entity: FxHashMap<EntityId, WindowId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_renderer: Option<crate::InspectorRenderer>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -821,6 +822,7 @@ impl App {
                 tracked_entities: FxHashMap::default(),
                 window_invalidators_by_entity: FxHashMap::default(),
                 current_window_by_entity: FxHashMap::default(),
+                window_context_by_entity: FxHashMap::default(),
                 event_listeners: SubscriberSet::new(),
                 release_listeners: SubscriberSet::new(),
                 keystroke_observers: SubscriberSet::new(),
@@ -1607,6 +1609,7 @@ impl App {
                 self.event_listeners.remove(&entity_id);
                 self.window_invalidators_by_entity.remove(&entity_id);
                 self.current_window_by_entity.remove(&entity_id);
+                self.window_context_by_entity.remove(&entity_id);
                 for release_callback in self.release_listeners.remove(&entity_id) {
                     release_callback(entity.as_mut(), self);
                 }
@@ -1714,7 +1717,11 @@ impl App {
         entity_id: EntityId,
         f: impl FnOnce(&mut Window, &mut App) -> R,
     ) -> Option<R> {
-        let window_id = *self.current_window_by_entity.get(&entity_id)?;
+        let window_id = self
+            .window_context_by_entity
+            .get(&entity_id)
+            .or_else(|| self.current_window_by_entity.get(&entity_id))
+            .copied()?;
         self.update_window_id(window_id, |_, window, cx| f(window, cx))
             .ok()
     }
@@ -1742,6 +1749,8 @@ impl App {
                 if window.removed {
                     cx.window_handles.remove(&id);
                     cx.windows.remove(id);
+                    cx.window_context_by_entity
+                        .retain(|_, window_id| *window_id != id);
                     if let Some(tracked) = cx.tracked_entities.remove(&id) {
                         for entity_id in tracked {
                             if let Some(windows) =
