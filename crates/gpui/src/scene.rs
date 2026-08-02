@@ -43,6 +43,9 @@ pub struct Scene {
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
     pub backdrop_blurs: Vec<BackdropBlur>,
+    /// When set, the renderer composites the theme-transition overlay (old
+    /// snapshot over this frame) at the end of this draw.
+    pub transition: Option<TransitionParams>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -60,6 +63,7 @@ impl Scene {
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.backdrop_blurs.clear();
+        self.transition = None;
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
@@ -596,6 +600,33 @@ impl From<BackdropBlur> for Primitive {
     fn from(blur: BackdropBlur) -> Self {
         Primitive::BackdropBlur(blur)
     }
+}
+
+/// Per-frame parameters for a renderer-native theme transition, uploaded to
+/// the GPU as a constant buffer. The renderer composites a snapshot of the
+/// pre-change frame over a stable snapshot of the freshly drawn frame through
+/// the selected reveal mask. See `crate::window_effects` for the driving state
+/// machine.
+#[derive(Debug, Copy, Clone)]
+#[repr(C)]
+pub struct TransitionParams {
+    /// Reveal origin in physical pixels.
+    pub origin: [f32; 2],
+    /// Radius (physical pixels) at which the reveal covers the whole frame.
+    pub max_radius: f32,
+    /// Eased reveal progress in `0.0..=1.0`.
+    pub progress: f32,
+    /// Initial rectangle insets as normalized `[top, right, bottom, left]`.
+    pub rectangle_insets: [f32; 4],
+    /// Eased progress used to sharpen the CircleBlur incoming frame.
+    pub blur_progress: f32,
+    /// Feather width of the reveal edge in physical pixels.
+    pub edge_softness: f32,
+    /// Maximum blur radius in physical pixels.
+    pub blur_radius: f32,
+    /// Transition style: `0.0` = rectangle, `1.0` = circle, `2.0` = circle blur.
+    /// See `TransitionStyle::as_shader_value`.
+    pub style: f32,
 }
 
 #[derive(Debug, Copy, Clone)]

@@ -18594,6 +18594,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
+ "futures 0.3.32",
  "gpui",
  "gpui_util",
  "log",

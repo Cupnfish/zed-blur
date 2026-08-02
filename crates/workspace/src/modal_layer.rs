@@ -1,6 +1,6 @@
 use gpui::{
-    AnyView, App, DismissEvent, Entity, EventEmitter, FocusHandle, Global, ManagedView,
-    MouseButton, Subscription, WeakFocusHandle,
+    AnyView, App, Corners, DismissEvent, Entity, EventEmitter, FocusHandle, Global, ManagedView,
+    MouseButton, Subscription, WeakFocusHandle, canvas,
 };
 use ui::prelude::*;
 
@@ -278,7 +278,33 @@ impl Render for ModalLayer {
             .when(active_modal.modal.fade_out_background(cx), |this| {
                 let mut background = cx.theme().colors().elevated_surface_background;
                 background.fade_out(0.2);
-                this.bg(background)
+                // Blur the pre-modal frame beneath the dim tint when window
+                // effects are enabled (CSS backdrop-filter style). The blur
+                // canvas must sit below the tint: a div paints its bg before
+                // its children, so an opaque blur child would otherwise cover
+                // a same-div `.bg()`. The capture happens in paint phase,
+                // after the modal-free scene is drawn.
+                let this = if gpui::window_effects_enabled() {
+                    this.child(
+                        canvas(
+                            |_, _, _| {},
+                            |bounds, (), window, _| {
+                                window.paint_backdrop_blur(
+                                    bounds,
+                                    Corners::default(),
+                                    px(24.0),
+                                    1.6,
+                                );
+                            },
+                        )
+                        .absolute()
+                        .inset_0()
+                        .size_full(),
+                    )
+                } else {
+                    this
+                };
+                this.child(div().absolute().inset_0().size_full().bg(background))
             })
             .on_mouse_down(
                 MouseButton::Left,

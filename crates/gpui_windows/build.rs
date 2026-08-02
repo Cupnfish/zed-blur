@@ -40,6 +40,7 @@ mod shader_compilation {
             "polychrome_sprite",
             "backdrop_blur_pass",
             "backdrop_blur",
+            "theme_transition",
         ];
 
         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);

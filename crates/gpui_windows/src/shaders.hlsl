@@ -1356,3 +1356,87 @@ float4 backdrop_blur_fragment(BackdropBlurFragmentInput input): SV_Target {
     float alpha = saturate(0.5 - distance);
     return float4(color.rgb * alpha, alpha);
 }
+
+/*
+**
+**              Theme transition
+**
+** Composites the snapshot of the pre-change frame over the freshly drawn
+** frame through one of the reference component's rectangle, circle, or
+** circle-blur reveals. Both sharp sides are stable snapshots; CircleBlur's
+** two downsampled blur levels are generated once per transition.
+**
+*/
+
+struct ThemeTransitionParams {
+    float2 origin;
+    float max_radius;
+    float progress;
+    float4 rectangle_insets;
+    float blur_progress;
+    float edge_softness;
+    float blur_radius;
+    // 0 = rectangle, 1 = circle, 2 = circle blur.
+    float style;
+};
+
+StructuredBuffer<ThemeTransitionParams> theme_transition_params: register(t1);
+Texture2D theme_transition_snapshot: register(t2);
+Texture2D theme_transition_incoming: register(t3);
+Texture2D theme_transition_medium_blur: register(t4);
+Texture2D theme_transition_full_blur: register(t5);
+
+struct ThemeTransitionVertexOutput {
+    float4 position: SV_Position;
+    float2 texture_coords: TEXCOORD0;
+};
+
+ThemeTransitionVertexOutput theme_transition_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    ThemeTransitionVertexOutput output;
+    output.position = float4(unit_vertex * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+    output.texture_coords = unit_vertex;
+    return output;
+}
+
+float4 theme_transition_fragment(ThemeTransitionVertexOutput input): SV_Target {
+    ThemeTransitionParams params = theme_transition_params[0];
+    float4 old_color = theme_transition_snapshot.Sample(s_sprite, input.texture_coords);
+    float4 sharp_incoming = theme_transition_incoming.Sample(s_sprite, input.texture_coords);
+    float4 incoming_color = sharp_incoming;
+
+    if (params.style > 1.5) {
+        float4 medium_blur = theme_transition_medium_blur.Sample(s_sprite, input.texture_coords);
+        float4 full_blur = theme_transition_full_blur.Sample(s_sprite, input.texture_coords);
+        if (params.blur_progress < 0.5) {
+            incoming_color = lerp(full_blur, medium_blur, params.blur_progress * 2.0);
+        } else {
+            incoming_color = lerp(medium_blur, sharp_incoming,
+                                  (params.blur_progress - 0.5) * 2.0);
+        }
+    }
+
+    float mask;
+    if (params.style > 0.5) {
+        // Circle and CircleBlur share the reference circle(0% -> 150%) mask.
+        float radius = params.max_radius * params.progress;
+        float distance_from_origin = distance(input.position.xy, params.origin);
+        mask = 1.0 - smoothstep(radius - params.edge_softness,
+                                radius + params.edge_softness,
+                                distance_from_origin);
+    } else {
+        // Animate the exact reference inset(top right bottom left) to zero.
+        float4 insets = params.rectangle_insets * (1.0 - params.progress);
+        float2 minimum = float2(insets.w, insets.x);
+        float2 maximum = float2(1.0 - insets.y, 1.0 - insets.z);
+        float2 outside = max(max(minimum - input.texture_coords,
+                                 input.texture_coords - maximum), 0.0);
+        float outside_distance = length(outside * global_viewport_size);
+        mask = 1.0 - smoothstep(0.0, params.edge_softness, outside_distance);
+    }
+    if (params.progress <= 0.00001) {
+        mask = 0.0;
+    }
+
+    return lerp(old_color, incoming_color, mask);
+}

@@ -6,7 +6,10 @@ use std::{
     path::PathBuf,
     rc::{Rc, Weak},
     str::FromStr,
-    sync::{Arc, Once, atomic::AtomicBool},
+    sync::{
+        Arc, Once,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -69,6 +72,7 @@ pub struct WindowsWindowState {
     /// cache, which would otherwise replay stale atlas tile references from
     /// the previous frame and panic in `DirectXAtlasState::texture`.
     pub force_render_after_recovery: Cell<bool>,
+    pub theme_transition_frame_pending: Arc<AtomicBool>,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -101,6 +105,7 @@ pub(crate) struct WindowsWindowInner {
     pub(crate) main_receiver: PriorityQueueReceiver<RunnableVariant>,
     pub(crate) platform_window_handle: HWND,
     pub(crate) parent_hwnd: Option<HWND>,
+    theme_transition_windows: ThemeTransitionWindows,
 }
 
 impl WindowsWindowState {
@@ -169,6 +174,7 @@ impl WindowsWindowState {
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
             force_render_after_recovery: Cell::new(false),
+            theme_transition_frame_pending: Arc::new(AtomicBool::new(false)),
             click_state,
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
@@ -272,7 +278,33 @@ impl WindowsWindowInner {
             platform_window_handle: context.platform_window_handle,
             system_settings: WindowsSystemSettings::new(),
             parent_hwnd: context.parent_hwnd,
+            theme_transition_windows: context.theme_transition_windows.clone(),
         }))
+    }
+
+    fn start_theme_transition_animation(&self) {
+        self.state
+            .theme_transition_frame_pending
+            .store(false, Ordering::Release);
+        let mut windows = self.theme_transition_windows.write();
+        if !windows
+            .iter()
+            .any(|window| window.hwnd.as_raw() == self.hwnd)
+        {
+            windows.push(RegisteredThemeTransitionWindow {
+                hwnd: self.hwnd.into(),
+                frame_pending: self.state.theme_transition_frame_pending.clone(),
+            });
+        }
+    }
+
+    fn stop_theme_transition_animation(&self) {
+        self.theme_transition_windows
+            .write()
+            .retain(|window| window.hwnd.as_raw() != self.hwnd);
+        self.state
+            .theme_transition_frame_pending
+            .store(false, Ordering::Release);
     }
 
     fn toggle_fullscreen(self: &Rc<Self>) {
@@ -402,6 +434,7 @@ struct WindowCreateContext {
     disable_direct_composition: bool,
     directx_devices: DirectXDevices,
     invalidate_devices: Arc<AtomicBool>,
+    theme_transition_windows: ThemeTransitionWindows,
     parent_hwnd: Option<HWND>,
 }
 
@@ -429,6 +462,7 @@ impl WindowsWindow {
             disable_direct_composition,
             directx_devices,
             invalidate_devices,
+            theme_transition_windows,
         } = creation_info;
         register_window_class(icon);
         let parent_hwnd = if params.kind == WindowKind::Dialog {
@@ -513,6 +547,7 @@ impl WindowsWindow {
             disable_direct_composition,
             directx_devices,
             invalidate_devices,
+            theme_transition_windows,
             parent_hwnd,
         };
         let creation_result = unsafe {
@@ -580,6 +615,7 @@ impl rwh::HasDisplayHandle for WindowsWindow {
 
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
+        self.0.stop_theme_transition_animation();
         // clone this `Rc` to prevent early release of the pointer
         let this = self.0.clone();
         self.0
@@ -980,6 +1016,33 @@ impl PlatformWindow for WindowsWindow {
             .borrow_mut()
             .draw(scene, self.state.background_appearance.get())
             .log_err();
+    }
+
+    fn theme_transition_supported(&self) -> bool {
+        true
+    }
+
+    fn capture_theme_transition_snapshot(&self) -> bool {
+        match self
+            .state
+            .renderer
+            .borrow_mut()
+            .capture_theme_transition_snapshot()
+        {
+            Ok(captured) => captured,
+            Err(error) => {
+                log::error!("failed to capture theme-transition snapshot: {error:#}");
+                false
+            }
+        }
+    }
+
+    fn start_theme_transition_animation(&self) {
+        self.0.start_theme_transition_animation();
+    }
+
+    fn stop_theme_transition_animation(&self) {
+        self.0.stop_theme_transition_animation();
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

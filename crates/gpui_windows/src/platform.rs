@@ -33,6 +33,7 @@ use gpui::*;
 pub struct WindowsPlatform {
     inner: Rc<WindowsPlatformInner>,
     raw_window_handles: Arc<RwLock<SmallVec<[SafeHwnd; 4]>>>,
+    theme_transition_windows: ThemeTransitionWindows,
     // The below members will never change throughout the entire lifecycle of the app.
     headless: bool,
     icon: HICON,
@@ -47,6 +48,15 @@ pub struct WindowsPlatform {
     handle: HWND,
     suspend_resume_notification: RefCell<Option<HPOWERNOTIFY>>,
     disable_direct_composition: bool,
+}
+
+pub(crate) type ThemeTransitionWindows =
+    Arc<RwLock<SmallVec<[RegisteredThemeTransitionWindow; 4]>>>;
+
+#[derive(Clone)]
+pub(crate) struct RegisteredThemeTransitionWindow {
+    pub hwnd: SafeHwnd,
+    pub frame_pending: Arc<AtomicBool>,
 }
 
 struct WindowsPlatformInner {
@@ -129,6 +139,7 @@ impl WindowsPlatform {
             rand::random::<u32>() as usize
         };
         let raw_window_handles = Arc::new(RwLock::new(SmallVec::new()));
+        let theme_transition_windows = Arc::new(RwLock::new(SmallVec::new()));
 
         register_platform_window_class();
         let mut context = PlatformWindowCreateContext {
@@ -189,6 +200,7 @@ impl WindowsPlatform {
             inner,
             handle,
             raw_window_handles,
+            theme_transition_windows,
             headless,
             icon,
             background_executor,
@@ -233,6 +245,7 @@ impl WindowsPlatform {
             disable_direct_composition: self.disable_direct_composition,
             directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
             invalidate_devices: self.invalidate_devices.clone(),
+            theme_transition_windows: self.theme_transition_windows.clone(),
         }
     }
 
@@ -308,6 +321,7 @@ impl WindowsPlatform {
         let platform_window: SafeHwnd = self.handle.into();
         let validation_number = self.inner.validation_number;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
+        let theme_transition_windows = Arc::downgrade(&self.theme_transition_windows);
         let text_system = Arc::downgrade(direct_write_text_system);
         let invalidate_devices = self.invalidate_devices.clone();
 
@@ -333,9 +347,34 @@ impl WindowsPlatform {
                     let Some(all_windows) = all_windows.upgrade() else {
                         break;
                     };
+                    let Some(theme_transition_windows) = theme_transition_windows.upgrade() else {
+                        break;
+                    };
+                    let transition_windows = theme_transition_windows.read();
                     for hwnd in all_windows.read().iter() {
-                        unsafe {
-                            let _ = RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
+                        if let Some(transition) = transition_windows
+                            .iter()
+                            .find(|transition| transition.hwnd.as_raw() == hwnd.as_raw())
+                        {
+                            if !transition.frame_pending.swap(true, Ordering::AcqRel) {
+                                let posted = unsafe {
+                                    PostMessageW(
+                                        Some(hwnd.as_raw()),
+                                        WM_GPUI_THEME_TRANSITION_FRAME,
+                                        WPARAM(validation_number),
+                                        LPARAM(0),
+                                    )
+                                };
+                                if posted.is_err() {
+                                    transition.frame_pending.store(false, Ordering::Release);
+                                    posted.log_err();
+                                }
+                            }
+                        } else {
+                            unsafe {
+                                let _ =
+                                    RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
+                            }
                         }
                     }
                 }
@@ -1092,6 +1131,7 @@ pub(crate) struct WindowCreationInfo {
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
     pub(crate) invalidate_devices: Arc<AtomicBool>,
+    pub(crate) theme_transition_windows: ThemeTransitionWindows,
 }
 
 struct PlatformWindowCreateContext {

@@ -763,6 +763,27 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;
 
+    /// Whether this platform's renderer can snapshot the presented frame and
+    /// composite a theme-transition overlay (see `crate::window_effects`).
+    fn theme_transition_supported(&self) -> bool {
+        false
+    }
+
+    /// Capture the last presented frame as the old side of a theme
+    /// transition. Returns `false` if no stable frame can be captured.
+    fn capture_theme_transition_snapshot(&self) -> bool {
+        false
+    }
+
+    /// Start a short-lived platform frame source for a renderer-native theme
+    /// transition. Platforms whose normal frame source already guarantees
+    /// fair multi-window animation may leave this as a no-op.
+    fn start_theme_transition_animation(&self) {}
+
+    /// Stop the platform frame source started by
+    /// [`Self::start_theme_transition_animation`].
+    fn stop_theme_transition_animation(&self) {}
+
     // macOS specific methods
     fn get_title(&self) -> String {
         String::new()

@@ -19,6 +19,7 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 collections.workspace = true
+futures.workspace = true
 gpui.workspace = true
 gpui_util.workspace = true
 log.workspace = true

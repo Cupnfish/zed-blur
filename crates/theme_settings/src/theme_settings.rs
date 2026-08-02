@@ -8,16 +8,16 @@
 mod schema;
 mod settings;
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use ::settings::{IntoGpui, Settings, SettingsStore};
 use anyhow::{Context as _, Result};
-use gpui::{App, Font, HighlightStyle, Pixels, Refineable, px};
+use gpui::{App, AppContext as _, Font, HighlightStyle, Pixels, Refineable, px};
 use gpui_util::ResultExt;
 use theme::{
-    AccentColors, Appearance, AppearanceContent, DEFAULT_DARK_THEME, DEFAULT_ICON_THEME_NAME,
-    GlobalTheme, LoadThemes, PlayerColor, PlayerColors, StatusColors, SyntaxTheme,
-    SystemAppearance, SystemColors, Theme, ThemeColors, ThemeFamily, ThemeRegistry,
+    AccentColors, ActiveTheme, Appearance, AppearanceContent, DEFAULT_DARK_THEME,
+    DEFAULT_ICON_THEME_NAME, GlobalTheme, LoadThemes, PlayerColor, PlayerColors, StatusColors,
+    SyntaxTheme, SystemAppearance, SystemColors, Theme, ThemeColors, ThemeFamily, ThemeRegistry,
     ThemeSettingsProvider, ThemeStyles, default_color_scales, try_parse_color,
 };
 
@@ -200,11 +200,104 @@ fn configured_icon_theme(cx: &mut App) -> Arc<theme::IconTheme> {
     }
 }
 
+/// How long to wait for the renderer to snapshot the pre-change frame
+/// before falling back to a synchronous theme swap (e.g. when the window is
+/// occluded and presents no frames).
+const TRANSITION_SNAPSHOT_TIMEOUT: Duration = Duration::from_millis(64);
+
 /// Reloads the current theme from settings.
+///
+/// When window effects are enabled and the theme actually changes, every
+/// open window performs a renderer-native transition: each window snapshots
+/// its pre-change frame, then the new theme is applied globally and revealed
+/// per window with a circular animation. Any per-window failure (unsupported
+/// platform, reduced motion, occluded window, in-flight transition) falls
+/// back to the plain synchronous swap for that window.
 pub fn reload_theme(cx: &mut App) {
     let theme = configured_theme(cx);
-    GlobalTheme::update_theme(cx, theme);
-    cx.refresh_windows();
+
+    let current = cx.theme();
+    let theme_changed = theme.name != current.name || theme.appearance != current.appearance;
+    if !theme_changed || !gpui::window_effects_enabled() || cx.reduce_motion() {
+        GlobalTheme::update_theme(cx, theme);
+        cx.refresh_windows();
+        return;
+    }
+
+    // Arm the transition from a foreground task instead of inline: theme
+    // changes originate from actions dispatched inside a window update, and
+    // gpui takes the dispatching window out of its window store while
+    // dispatching, so `update_window` cannot re-enter it synchronously. One
+    // task hop later every window is armable.
+    let handles = cx.windows();
+    cx.spawn(async move |cx| {
+        let mut armed = Vec::new();
+        for handle in handles {
+            if let Ok(Some(task)) = cx.update_window(handle, |_, window, cx| {
+                if window.theme_transition_in_progress() {
+                    None
+                } else {
+                    window.begin_theme_transition(cx, gpui::TransitionOptions::default())
+                }
+            }) {
+                armed.push((handle, task));
+            }
+        }
+
+        if armed.is_empty() {
+            cx.update(|cx| {
+                GlobalTheme::update_theme(cx, theme);
+                cx.refresh_windows();
+            });
+            return;
+        }
+
+        // Wait for every window's snapshot (each bounded by the timeout),
+        // then apply the theme once and start the overlay in each captured
+        // window.
+        let timeouts: Vec<_> = (0..armed.len())
+            .map(|_| cx.background_executor().timer(TRANSITION_SNAPSHOT_TIMEOUT))
+            .collect();
+        let captured = futures::future::join_all(armed.into_iter().zip(timeouts).map(
+            |((handle, task), timeout)| async move {
+                match futures::future::select(task, timeout).await {
+                    futures::future::Either::Left((captured, _)) => (handle, captured),
+                    futures::future::Either::Right(((), _snapshot_task)) => (handle, false),
+                }
+            },
+        ))
+        .await;
+        cx.update(|cx| {
+            // If a newer theme change arrived while snapshots were in
+            // flight, that reload owns the apply; abort this one instead of
+            // overwriting the newer theme with a stale one.
+            let latest = configured_theme(cx);
+            if latest.name != theme.name || latest.appearance != theme.appearance {
+                for (handle, _) in captured {
+                    cx.update_window(handle, |_, window, _| {
+                        window.cancel_theme_transition();
+                    })
+                    .ok();
+                }
+                return;
+            }
+            GlobalTheme::update_theme(cx, theme);
+            cx.refresh_windows();
+            for (handle, captured) in captured {
+                cx.update_window(handle, |_, window, _| {
+                    if captured {
+                        window.start_theme_transition();
+                    } else {
+                        // Timed out or cancelled: stop requesting snapshots
+                        // so the renderer does not keep copying frames.
+                        window.cancel_theme_transition();
+                    }
+                })
+                .ok();
+            }
+        });
+    })
+    .detach();
 }
 
 /// Reloads the current icon theme from settings.

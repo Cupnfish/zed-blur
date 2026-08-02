@@ -28,6 +28,7 @@ pub(crate) const WM_GPUI_FORCE_UPDATE_WINDOW: u32 = WM_USER + 5;
 pub(crate) const WM_GPUI_KEYBOARD_LAYOUT_CHANGED: u32 = WM_USER + 6;
 pub(crate) const WM_GPUI_GPU_DEVICE_LOST: u32 = WM_USER + 7;
 pub(crate) const WM_GPUI_KEYDOWN: u32 = WM_USER + 8;
+pub(crate) const WM_GPUI_THEME_TRANSITION_FRAME: u32 = WM_USER + 9;
 
 const SIZE_MOVE_LOOP_TIMER_ID: usize = 1;
 
@@ -101,6 +102,7 @@ impl WindowsWindowInner {
             WM_SYSKEYUP => self.handle_syskeyup_msg(wparam, lparam),
             WM_KEYUP => self.handle_keyup_msg(wparam, lparam),
             WM_GPUI_KEYDOWN => self.handle_keydown_msg(wparam, lparam),
+            WM_GPUI_THEME_TRANSITION_FRAME => self.handle_theme_transition_frame(handle),
             WM_CHAR => self.handle_char_msg(wparam),
             WM_IME_STARTCOMPOSITION => self.handle_ime_position(handle),
             WM_IME_COMPOSITION => self.handle_ime_composition(handle, lparam),
@@ -258,6 +260,13 @@ impl WindowsWindowInner {
         } else {
             None
         }
+    }
+
+    fn handle_theme_transition_frame(&self, handle: HWND) -> Option<isize> {
+        self.state
+            .theme_transition_frame_pending
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.draw_window(handle, false)
     }
 
     fn handle_paint_msg(&self, handle: HWND) -> Option<isize> {

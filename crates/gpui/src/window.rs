@@ -15,10 +15,11 @@ use crate::{
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    TextStyleRefinement, ThemeTransitionMetrics, ThemeTransitionState, ThermalState,
+    TransformationMatrix, TransitionOptions, TransitionParams, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
     WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, profiler, px, rems, size,
-    transparent_black,
+    transparent_black, window_effects,
 };
 
 use anyhow::{Context as _, Result, anyhow};
@@ -1058,6 +1059,12 @@ pub struct Window {
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
     pub(crate) a11y: A11y,
+    /// Renderer-native theme-transition state (see `crate::window_effects`).
+    theme_transition: ThemeTransitionState,
+    /// Shared with the platform frame callback so inactive windows can keep
+    /// one-shot theme transitions smooth without disabling normal throttling.
+    theme_transition_smooth_frames: Rc<Cell<bool>>,
+    last_theme_transition_metrics: Option<ThemeTransitionMetrics>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1358,6 +1365,7 @@ impl Window {
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
         let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
         let last_frame_time = Rc::new(Cell::new(None));
+        let theme_transition_smooth_frames = Rc::new(Cell::new(false));
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
@@ -1470,6 +1478,7 @@ impl Window {
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
+            let theme_transition_smooth_frames = theme_transition_smooth_frames.clone();
             move |request_frame_options| {
                 let thermal_state = handle
                     .update(&mut cx, |_, _, cx| cx.thermal_state())
@@ -1483,7 +1492,7 @@ impl Window {
                     && next_frame_callbacks.borrow().is_empty()
                 {
                     None
-                } else if !active.get() {
+                } else if !active.get() && !theme_transition_smooth_frames.get() {
                     Some(Duration::from_micros(33333))
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
                     Some(Duration::from_micros(16667))
@@ -1767,6 +1776,9 @@ impl Window {
                 accessibility_force_disabled,
                 initial_window_title,
             ),
+            theme_transition: ThemeTransitionState::default(),
+            theme_transition_smooth_frames,
+            last_theme_transition_metrics: None,
         })
     }
 
@@ -1898,6 +1910,140 @@ impl Window {
     /// Close this window.
     pub fn remove_window(&mut self) {
         self.removed = true;
+    }
+
+    /// Begin preparing a renderer-native theme transition.
+    ///
+    /// The renderer synchronously copies the last presented (old-theme) frame
+    /// into its transition texture. The returned ready task resolves to
+    /// `true` once the snapshot has been captured; the host should then apply
+    /// the new theme, refresh the window, and call
+    /// [`Self::start_theme_transition`]. It resolves to `false` if the
+    /// transition was cancelled or the window could not present a frame.
+    ///
+    /// Returns `None` when the platform renderer does not support
+    /// transitions, the options are invalid, or a transition is already in
+    /// progress.
+    pub fn begin_theme_transition(
+        &mut self,
+        _cx: &App,
+        options: TransitionOptions,
+    ) -> Option<Task<bool>> {
+        if !self.platform_window.theme_transition_supported() {
+            return None;
+        }
+        if window_effects::validate_options(options).is_err() {
+            return None;
+        }
+        if self.theme_transition_in_progress() {
+            return None;
+        }
+        if !self.platform_window.capture_theme_transition_snapshot() {
+            return None;
+        }
+        self.theme_transition = ThemeTransitionState::ReadyToStart { options };
+        self.last_theme_transition_metrics = None;
+        window_effects::trace("snapshot captured");
+        Some(Task::ready(true))
+    }
+
+    /// Start the transition overlay after the host has applied the new theme
+    /// and refreshed the window. No-op unless a snapshot has been captured.
+    pub fn start_theme_transition(&mut self) {
+        if let ThemeTransitionState::ReadyToStart { options } =
+            mem::take(&mut self.theme_transition)
+        {
+            let start = Instant::now();
+            self.theme_transition = ThemeTransitionState::Active {
+                options,
+                start,
+                last_frame: start,
+                frame_count: 0,
+                max_frame_gap: Duration::ZERO,
+            };
+            self.theme_transition_smooth_frames.set(true);
+            self.platform_window.start_theme_transition_animation();
+            window_effects::trace("transition started");
+            self.refresh();
+        }
+    }
+
+    /// Cancel any armed, captured, or animating theme transition.
+    pub fn cancel_theme_transition(&mut self) {
+        if !self.theme_transition_in_progress() {
+            return;
+        }
+        self.theme_transition = ThemeTransitionState::Idle;
+        self.theme_transition_smooth_frames.set(false);
+        self.platform_window.stop_theme_transition_animation();
+        self.last_theme_transition_metrics = None;
+        window_effects::trace("transition cancelled");
+    }
+
+    /// Whether a theme transition is armed, captured, or animating.
+    pub fn theme_transition_in_progress(&self) -> bool {
+        !matches!(self.theme_transition, ThemeTransitionState::Idle)
+    }
+
+    /// Timing from the most recently completed native theme transition.
+    pub fn last_theme_transition_metrics(&self) -> Option<ThemeTransitionMetrics> {
+        self.last_theme_transition_metrics
+    }
+
+    /// Advance the theme-transition state machine and return the overlay
+    /// parameters for this frame, if animating.
+    fn theme_transition_scene_update(&mut self) -> Option<TransitionParams> {
+        match &mut self.theme_transition {
+            ThemeTransitionState::Idle | ThemeTransitionState::ReadyToStart { .. } => None,
+            ThemeTransitionState::Active {
+                options,
+                start,
+                last_frame,
+                frame_count,
+                max_frame_gap,
+            } => {
+                let now = Instant::now();
+                *max_frame_gap = (*max_frame_gap).max(now.duration_since(*last_frame));
+                *last_frame = now;
+                *frame_count = frame_count.saturating_add(1);
+                let elapsed = now.duration_since(*start);
+                let linear =
+                    (elapsed.as_secs_f32() / options.duration.as_secs_f32()).clamp(0.0, 1.0);
+                if linear >= 1.0 {
+                    let metrics = ThemeTransitionMetrics {
+                        frame_count: *frame_count,
+                        max_frame_gap: *max_frame_gap,
+                        elapsed,
+                    };
+                    self.last_theme_transition_metrics = Some(metrics);
+                    window_effects::trace(&format!(
+                        "transition finished: {} frames, max gap {:.1}ms",
+                        metrics.frame_count,
+                        metrics.max_frame_gap.as_secs_f64() * 1000.0
+                    ));
+                    self.theme_transition = ThemeTransitionState::Idle;
+                    self.theme_transition_smooth_frames.set(false);
+                    self.platform_window.stop_theme_transition_animation();
+                    return None;
+                }
+                let scale = self.scale_factor;
+                let width = self.viewport_size.width.0 * scale;
+                let height = self.viewport_size.height.0 * scale;
+                let (origin, max_radius) =
+                    window_effects::reveal_geometry(options.origin, width, height);
+                let progress = window_effects::transition_ease(options.style, linear);
+                Some(TransitionParams {
+                    origin,
+                    max_radius,
+                    progress,
+                    rectangle_insets: window_effects::rectangle_insets(options.origin),
+                    blur_progress: progress,
+                    edge_softness: 0.75,
+                    blur_radius: options.blur_radius * scale,
+                    style: options.style.as_shader_value(),
+                })
+            }
+        }
     }
 
     /// Obtain the currently focused [`FocusHandle`]. If no elements are focused, returns `None`.
@@ -2288,6 +2434,10 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
+        // A theme-transition snapshot is pinned to the pre-resize geometry;
+        // abort rather than stretch or misalign the overlay.
+        self.cancel_theme_transition();
+
         self.scale_factor = self.platform_window.scale_factor();
         self.viewport_size = self.platform_window.content_size();
         self.display_id = self.platform_window.display().map(|display| display.id());
@@ -2730,6 +2880,9 @@ impl Window {
             self.platform_window.set_input_handler(input_handler);
         }
 
+        // Drive the theme-transition state machine for this frame.
+        self.next_frame.scene.transition = self.theme_transition_scene_update();
+
         self.layout_engine.as_mut().unwrap().clear();
         self.text_system().finish_frame();
         self.next_frame.finish(&mut self.rendered_frame);
@@ -2784,6 +2937,10 @@ impl Window {
         // schedule another frame here to render the new focus state and dispatch the
         // resulting focus events.
         if self.focus != focus_before_listeners {
+            self.refresh();
+        }
+        // Keep presenting frames while a theme transition animates.
+        if matches!(self.theme_transition, ThemeTransitionState::Active { .. }) {
             self.refresh();
         }
         self.needs_present.set(true);
@@ -4660,6 +4817,17 @@ impl Window {
         };
         if self.last_input_modality != old_modality {
             self.refresh();
+        }
+
+        // A theme transition replays the pre-change frame on top of the live
+        // UI; the first deliberate input aborts it. (The out-of-process
+        // overlay it replaces blocked input entirely, so aborting on the
+        // first press is behavior-compatible.)
+        if matches!(
+            event,
+            PlatformInput::KeyDown(_) | PlatformInput::MouseDown(_)
+        ) {
+            self.cancel_theme_transition();
         }
 
         // Handlers may set this to false by calling `stop_propagation`.

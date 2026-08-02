@@ -29,6 +29,8 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 // Backdrop blurs run on a downsampled copy of the framebuffer; higher is faster.
 const BLUR_DOWNSAMPLE: u32 = 2;
+// Theme-transition blur is precomputed once and can use a smaller working set.
+const THEME_BLUR_DOWNSAMPLE: u32 = 4;
 
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
@@ -55,6 +57,16 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+
+    /// Whether the sharp incoming frame has been captured for the current
+    /// theme transition.
+    transition_incoming_captured: bool,
+    /// Whether the two CircleBlur levels have been precomputed for the current
+    /// incoming snapshot.
+    transition_blur_ready: bool,
+    /// Whether `presented_texture` contains a complete frame from this
+    /// swapchain size/device generation.
+    presented_frame_valid: bool,
 }
 
 /// Direct3D objects
@@ -82,6 +94,9 @@ struct DirectXResources {
     // Backdrop blur intermediate textures
     backdrop_blur: BackdropBlurResources,
 
+    // Theme transition textures (stable old and incoming frames)
+    theme_transition: ThemeTransitionResources,
+
     // Cached viewport
     viewport: D3D11_VIEWPORT,
 }
@@ -102,6 +117,25 @@ struct BackdropBlurResources {
     viewport: D3D11_VIEWPORT,
 }
 
+/// Full-size, stable snapshots of the old and incoming frames used to
+/// composite a renderer-native theme transition.
+struct ThemeTransitionResources {
+    presented_texture: ID3D11Texture2D,
+    snapshot_texture: ID3D11Texture2D,
+    snapshot_srv: Option<ID3D11ShaderResourceView>,
+    incoming_texture: ID3D11Texture2D,
+    incoming_srv: Option<ID3D11ShaderResourceView>,
+    blur_ping_rtv: Option<ID3D11RenderTargetView>,
+    blur_ping_srv: Option<ID3D11ShaderResourceView>,
+    blur_pong_rtv: Option<ID3D11RenderTargetView>,
+    blur_pong_srv: Option<ID3D11ShaderResourceView>,
+    medium_blur_rtv: Option<ID3D11RenderTargetView>,
+    medium_blur_srv: Option<ID3D11ShaderResourceView>,
+    full_blur_rtv: Option<ID3D11RenderTargetView>,
+    full_blur_srv: Option<ID3D11ShaderResourceView>,
+    blur_viewport: D3D11_VIEWPORT,
+}
+
 struct DirectXRenderPipelines {
     shadow_pipeline: PipelineState<Shadow>,
     quad_pipeline: PipelineState<Quad>,
@@ -113,6 +147,7 @@ struct DirectXRenderPipelines {
     poly_sprites: PipelineState<PolychromeSprite>,
     backdrop_blur_pass_pipeline: PipelineState<BackdropBlurPassParams>,
     backdrop_blur_pipeline: PipelineState<BackdropBlur>,
+    theme_transition_pipeline: PipelineState<ThemeTransitionParams>,
 }
 
 struct DirectXGlobalElements {
@@ -197,6 +232,9 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            transition_incoming_captured: false,
+            transition_blur_ready: false,
+            presented_frame_valid: false,
         })
     }
 
@@ -378,6 +416,13 @@ impl DirectXRenderer {
                 scene.surfaces.len(),
             ))?;
         }
+        self.handle_theme_transition(scene)?;
+        // The pre-transition frame must remain stable while the overlay is
+        // active. Retain the next non-transition frame once the animation (or
+        // a cancellation) has settled.
+        if scene.transition.is_none() {
+            self.retain_presented_frame()?;
+        }
         self.present()
     }
 
@@ -421,6 +466,7 @@ impl DirectXRenderer {
                 .device_context
                 .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
         }
+        self.presented_frame_valid = false;
 
         Ok(())
     }
@@ -713,40 +759,269 @@ impl DirectXRenderer {
                 unsafe {
                     // Unbind the previous pass' source before making it a
                     // render target again.
-                    devices.device_context.PSSetShaderResources(0, Some(&[None]));
+                    devices
+                        .device_context
+                        .PSSetShaderResources(0, Some(&[None]));
                     devices
                         .device_context
                         .OMSetRenderTargets(Some(slice::from_ref(target)), None);
                 }
-                self.pipelines.backdrop_blur_pass_pipeline.draw_with_texture(
-                    &devices.device_context,
-                    slice::from_ref(source),
-                    slice::from_ref(&blur_resources.viewport),
-                    slice::from_ref(&self.globals.global_params_buffer),
-                    slice::from_ref(&blur_resources.sampler),
-                    1,
-                )?;
+                self.pipelines
+                    .backdrop_blur_pass_pipeline
+                    .draw_with_texture(
+                        &devices.device_context,
+                        slice::from_ref(source),
+                        slice::from_ref(&blur_resources.viewport),
+                        slice::from_ref(&self.globals.global_params_buffer),
+                        slice::from_ref(&blur_resources.sampler),
+                        1,
+                    )?;
             }
 
             // Restore the main render target and composite the blurred
             // backdrop, masked by the primitive's rounded corners.
             unsafe {
-                devices.device_context.PSSetShaderResources(0, Some(&[None]));
-                devices.device_context.OMSetRenderTargets(
-                    Some(slice::from_ref(&resources.render_target_view)),
-                    None,
-                );
+                devices
+                    .device_context
+                    .PSSetShaderResources(0, Some(&[None]));
+                devices
+                    .device_context
+                    .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
             }
-            self.pipelines.backdrop_blur_pipeline.draw_range_with_texture(
-                &devices.device,
-                &devices.device_context,
-                slice::from_ref(&blur_resources.ping_srv),
-                slice::from_ref(&resources.viewport),
-                slice::from_ref(&self.globals.global_params_buffer),
-                slice::from_ref(&blur_resources.sampler),
-                (start + index) as u32,
-                1,
-            )?;
+            self.pipelines
+                .backdrop_blur_pipeline
+                .draw_range_with_texture(
+                    &devices.device,
+                    &devices.device_context,
+                    slice::from_ref(&blur_resources.ping_srv),
+                    slice::from_ref(&resources.viewport),
+                    slice::from_ref(&self.globals.global_params_buffer),
+                    slice::from_ref(&blur_resources.sampler),
+                    (start + index) as u32,
+                    1,
+                )?;
+        }
+
+        Ok(())
+    }
+
+    /// Capture the last presented frame as the old side of a theme
+    /// transition. This is synchronous from GPUI's point of view; Direct3D
+    /// preserves the copy ordering on the immediate context.
+    pub(crate) fn capture_theme_transition_snapshot(&mut self) -> Result<bool> {
+        if self.skip_draws || !self.presented_frame_valid {
+            return Ok(false);
+        }
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        unsafe {
+            devices
+                .device_context
+                .PSSetShaderResources(2, Some(&[None, None, None, None]));
+            devices.device_context.CopyResource(
+                &resources.theme_transition.snapshot_texture,
+                &resources.theme_transition.presented_texture,
+            );
+        }
+        self.transition_incoming_captured = false;
+        self.transition_blur_ready = false;
+        Ok(true)
+    }
+
+    /// Retain exactly the frame about to be presented. Flip-model swapchains
+    /// do not guarantee that their current backbuffer still contains the last
+    /// presented pixels when a theme toggle arrives between draws.
+    fn retain_presented_frame(&mut self) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let render_target = resources
+            .render_target
+            .as_ref()
+            .context("missing render target")?;
+        unsafe {
+            devices
+                .device_context
+                .CopyResource(&resources.theme_transition.presented_texture, render_target);
+        }
+        self.presented_frame_valid = true;
+        Ok(())
+    }
+
+    /// Capture the first fully rendered incoming frame once, then composite
+    /// the selected reveal from the two stable snapshots on every frame.
+    fn handle_theme_transition(&mut self, scene: &Scene) -> Result<()> {
+        let Some(params) = scene.transition else {
+            return Ok(());
+        };
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let blur_resources = &resources.backdrop_blur;
+        let transition_resources = &resources.theme_transition;
+        let render_target = resources
+            .render_target
+            .as_ref()
+            .context("missing render target")?;
+
+        if !self.transition_incoming_captured {
+            // Retain the first complete new-theme frame. A dedicated texture
+            // is required here: BackdropBlurResources::source_texture is
+            // rewritten by every backdrop-blur primitive in later frames.
+            unsafe {
+                devices
+                    .device_context
+                    .PSSetShaderResources(2, Some(&[None, None, None, None]));
+                devices
+                    .device_context
+                    .CopyResource(&transition_resources.incoming_texture, render_target);
+            }
+            self.transition_incoming_captured = true;
+        }
+
+        if params.style > 1.5 && !self.transition_blur_ready {
+            let source_texel_size = [
+                1.0 / resources.viewport.Width,
+                1.0 / resources.viewport.Height,
+            ];
+            let blur_texel_size = [
+                1.0 / transition_resources.blur_viewport.Width,
+                1.0 / transition_resources.blur_viewport.Height,
+            ];
+            let full_sigma = (params.blur_radius / (2.0 * THEME_BLUR_DOWNSAMPLE as f32)).max(0.0);
+            let medium_sigma = full_sigma * 0.5;
+            let passes = [
+                (
+                    [0.0, 0.0],
+                    source_texel_size,
+                    0.0,
+                    &transition_resources.incoming_srv,
+                    &transition_resources.blur_ping_rtv,
+                ),
+                (
+                    [1.0, 0.0],
+                    blur_texel_size,
+                    full_sigma,
+                    &transition_resources.blur_ping_srv,
+                    &transition_resources.blur_pong_rtv,
+                ),
+                (
+                    [0.0, 1.0],
+                    blur_texel_size,
+                    full_sigma,
+                    &transition_resources.blur_pong_srv,
+                    &transition_resources.full_blur_rtv,
+                ),
+                (
+                    [1.0, 0.0],
+                    blur_texel_size,
+                    medium_sigma,
+                    &transition_resources.blur_ping_srv,
+                    &transition_resources.blur_pong_rtv,
+                ),
+                (
+                    [0.0, 1.0],
+                    blur_texel_size,
+                    medium_sigma,
+                    &transition_resources.blur_pong_srv,
+                    &transition_resources.medium_blur_rtv,
+                ),
+            ];
+            for (direction, texel_size, sigma, source, target) in passes {
+                let taps = (2.5 * sigma).ceil().clamp(0.0, 64.0);
+                self.pipelines.backdrop_blur_pass_pipeline.update_buffer(
+                    &devices.device,
+                    &devices.device_context,
+                    &[BackdropBlurPassParams {
+                        src_texel_size: texel_size,
+                        direction,
+                        sigma,
+                        taps,
+                        pad: [0.0; 2],
+                    }],
+                )?;
+                unsafe {
+                    devices
+                        .device_context
+                        .PSSetShaderResources(0, Some(&[None]));
+                    devices
+                        .device_context
+                        .OMSetRenderTargets(Some(slice::from_ref(target)), None);
+                }
+                self.pipelines
+                    .backdrop_blur_pass_pipeline
+                    .draw_with_texture(
+                        &devices.device_context,
+                        slice::from_ref(source),
+                        slice::from_ref(&transition_resources.blur_viewport),
+                        slice::from_ref(&self.globals.global_params_buffer),
+                        slice::from_ref(&blur_resources.sampler),
+                        1,
+                    )?;
+            }
+            unsafe {
+                devices
+                    .device_context
+                    .PSSetShaderResources(0, Some(&[None]));
+                devices
+                    .device_context
+                    .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            }
+            self.transition_blur_ready = true;
+        }
+
+        // Composite mix(old snapshot, revealed new frame, reveal mask) over
+        // the rendered scene. The params buffer is bound at t1 by the
+        // pipeline state; the two textures occupy t2 and t3.
+        self.pipelines.theme_transition_pipeline.update_buffer(
+            &devices.device,
+            &devices.device_context,
+            &[ThemeTransitionParams {
+                origin: params.origin,
+                max_radius: params.max_radius,
+                progress: params.progress,
+                rectangle_insets: params.rectangle_insets,
+                blur_progress: params.blur_progress,
+                edge_softness: params.edge_softness,
+                blur_radius: params.blur_radius,
+                style: params.style,
+            }],
+        )?;
+        let pipeline = &self.pipelines.theme_transition_pipeline;
+        unsafe {
+            devices
+                .device_context
+                .PSSetShaderResources(2, Some(&[None, None, None, None]));
+            devices
+                .device_context
+                .OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+        }
+        set_pipeline_state(
+            &devices.device_context,
+            slice::from_ref(&pipeline.view),
+            D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+            slice::from_ref(&resources.viewport),
+            &pipeline.vertex,
+            &pipeline.fragment,
+            slice::from_ref(&self.globals.global_params_buffer),
+            &pipeline.blend_state,
+        );
+        unsafe {
+            devices
+                .device_context
+                .PSSetSamplers(0, Some(slice::from_ref(&blur_resources.sampler)));
+            devices.device_context.PSSetShaderResources(
+                2,
+                Some(&[
+                    transition_resources.snapshot_srv.clone(),
+                    transition_resources.incoming_srv.clone(),
+                    transition_resources.medium_blur_srv.clone(),
+                    transition_resources.full_blur_srv.clone(),
+                ]),
+            );
+            devices.device_context.DrawInstanced(4, 1, 0, 0);
+            // Unbind so the snapshot targets never alias a bound SRV later.
+            devices
+                .device_context
+                .PSSetShaderResources(2, Some(&[None, None, None, None]));
         }
 
         Ok(())
@@ -895,6 +1170,11 @@ impl DirectXRenderer {
 
     pub(crate) fn mark_drawable(&mut self) {
         self.skip_draws = false;
+        // All GPU textures were recreated after the device-lost recovery;
+        // invalidate any retained transition state.
+        self.transition_incoming_captured = false;
+        self.transition_blur_ready = false;
+        self.presented_frame_valid = false;
     }
 }
 
@@ -927,6 +1207,7 @@ impl DirectXResources {
             viewport,
         ) = create_resources(devices, &swap_chain, width, height)?;
         let backdrop_blur = BackdropBlurResources::new(&devices.device, width, height)?;
+        let theme_transition = ThemeTransitionResources::new(&devices.device, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
 
         Ok(Self {
@@ -938,6 +1219,7 @@ impl DirectXResources {
             path_intermediate_msaa_view,
             path_intermediate_srv,
             backdrop_blur,
+            theme_transition,
             viewport,
         })
     }
@@ -965,6 +1247,7 @@ impl DirectXResources {
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
         self.path_intermediate_srv = path_intermediate_srv;
         self.backdrop_blur = BackdropBlurResources::new(&devices.device, width, height)?;
+        self.theme_transition = ThemeTransitionResources::new(&devices.device, width, height)?;
         self.viewport = viewport;
         Ok(())
     }
@@ -1050,6 +1333,55 @@ impl BackdropBlurResources {
     }
 }
 
+impl ThemeTransitionResources {
+    fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
+        // Keep a stable copy of every completed frame. Theme toggles can occur
+        // between draws, after a flip-model swapchain has rotated buffers.
+        let (presented_texture, _presented_srv) =
+            create_path_intermediate_texture(device, width, height)?;
+        // The swapchain backbuffer cannot be sampled directly, so retain both
+        // transition sides in dedicated full-size shader-resource textures.
+        let (snapshot_texture, snapshot_srv) =
+            create_path_intermediate_texture(device, width, height)?;
+        let (incoming_texture, incoming_srv) =
+            create_path_intermediate_texture(device, width, height)?;
+        let blur_width = width.div_ceil(THEME_BLUR_DOWNSAMPLE).max(1);
+        let blur_height = height.div_ceil(THEME_BLUR_DOWNSAMPLE).max(1);
+        let (blur_ping_rtv, blur_ping_srv) =
+            create_render_texture_views(device, blur_width, blur_height)?;
+        let (blur_pong_rtv, blur_pong_srv) =
+            create_render_texture_views(device, blur_width, blur_height)?;
+        let (medium_blur_rtv, medium_blur_srv) =
+            create_render_texture_views(device, blur_width, blur_height)?;
+        let (full_blur_rtv, full_blur_srv) =
+            create_render_texture_views(device, blur_width, blur_height)?;
+
+        Ok(Self {
+            presented_texture,
+            snapshot_texture,
+            snapshot_srv,
+            incoming_texture,
+            incoming_srv,
+            blur_ping_rtv,
+            blur_ping_srv,
+            blur_pong_rtv,
+            blur_pong_srv,
+            medium_blur_rtv,
+            medium_blur_srv,
+            full_blur_rtv,
+            full_blur_srv,
+            blur_viewport: D3D11_VIEWPORT {
+                TopLeftX: 0.0,
+                TopLeftY: 0.0,
+                Width: blur_width as f32,
+                Height: blur_height as f32,
+                MinDepth: 0.0,
+                MaxDepth: 1.0,
+            },
+        })
+    }
+}
+
 impl DirectXRenderPipelines {
     pub fn new(device: &ID3D11Device) -> Result<Self> {
         let shadow_pipeline = PipelineState::new(
@@ -1122,6 +1454,13 @@ impl DirectXRenderPipelines {
             1,
             create_blend_state_for_path_sprite(device)?,
         )?;
+        let theme_transition_pipeline = PipelineState::new(
+            device,
+            "theme_transition_pipeline",
+            ShaderModule::ThemeTransition,
+            1,
+            create_blend_state_disabled(device)?,
+        )?;
 
         Ok(Self {
             shadow_pipeline,
@@ -1134,6 +1473,7 @@ impl DirectXRenderPipelines {
             poly_sprites,
             backdrop_blur_pass_pipeline,
             backdrop_blur_pipeline,
+            theme_transition_pipeline,
         })
     }
 }
@@ -1405,6 +1745,25 @@ struct PathSprite {
     bounds: Bounds<ScaledPixels>,
 }
 
+/// GPU-facing theme transition parameters. Field order must match the
+/// `ThemeTransitionParams` struct in `shaders.hlsl` and the layout of
+/// `gpui::TransitionParams`.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct ThemeTransitionParams {
+    origin: [f32; 2],
+    max_radius: f32,
+    progress: f32,
+    rectangle_insets: [f32; 4],
+    blur_progress: f32,
+    edge_softness: f32,
+    blur_radius: f32,
+    /// 0 = rectangle, 1 = circle, 2 = circle blur.
+    style: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<ThemeTransitionParams>() == 48);
+
 /// Parameters for one downsample/blur pass over the captured framebuffer.
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -1566,6 +1925,21 @@ fn create_path_intermediate_texture(
     unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut shader_resource_view))? };
 
     Ok((texture, Some(shader_resource_view.unwrap())))
+}
+
+#[inline]
+fn create_render_texture_views(
+    device: &ID3D11Device,
+    width: u32,
+    height: u32,
+) -> Result<(
+    Option<ID3D11RenderTargetView>,
+    Option<ID3D11ShaderResourceView>,
+)> {
+    let (texture, srv) = create_path_intermediate_texture(device, width, height)?;
+    let mut rtv = None;
+    unsafe { device.CreateRenderTargetView(&texture, None, Some(&mut rtv))? };
+    Ok((rtv, srv))
 }
 
 #[inline]
@@ -1876,6 +2250,7 @@ pub(crate) mod shader_resources {
         EmojiRasterization,
         BackdropBlurPass,
         BackdropBlur,
+        ThemeTransition,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -2050,6 +2425,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
                 ShaderModule::BackdropBlurPass => "backdrop_blur_pass",
                 ShaderModule::BackdropBlur => "backdrop_blur",
+                ShaderModule::ThemeTransition => "theme_transition",
             }
         }
     }
