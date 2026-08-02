@@ -78,12 +78,49 @@ pub(crate) const XINPUT_ALL_DEVICE_GROUPS: xinput::DeviceId = 1;
 
 const GPUI_X11_SCALE_FACTOR_ENV: &str = "GPUI_X11_SCALE_FACTOR";
 
+fn supports_raw_events_during_grab(major_version: u16, minor_version: u16) -> bool {
+    // XI 2.1 made raw events visible while another client owns the active grab.
+    major_version > 2 || (major_version == 2 && minor_version >= 1)
+}
+
 pub(crate) struct WindowRef {
     window: X11WindowStatePtr,
     refresh_state: Option<RefreshState>,
     expose_event_received: bool,
     last_visibility: Visibility,
     is_mapped: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PointerDevice {
+    device_id: xinput::DeviceId,
+    source_id: xinput::DeviceId,
+}
+
+impl PointerDevice {
+    fn matches(self, device_id: xinput::DeviceId, source_id: xinput::DeviceId) -> bool {
+        self.device_id == device_id && self.source_id == source_id
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeWindowMove {
+    window: xproto::Window,
+    pointer_device: Option<PointerDevice>,
+}
+
+impl NativeWindowMove {
+    fn matches_release(
+        self,
+        detail: u32,
+        device_id: xinput::DeviceId,
+        source_id: xinput::DeviceId,
+    ) -> bool {
+        detail == 1
+            && self
+                .pointer_device
+                .is_none_or(|pointer_device| pointer_device.matches(device_id, source_id))
+    }
 }
 
 impl WindowRef {
@@ -216,6 +253,11 @@ pub struct X11ClientState {
 
     pointer_device_states: BTreeMap<xinput::DeviceId, PointerDeviceState>,
 
+    supports_raw_events_during_grab: bool,
+    last_left_button_device: Option<PointerDevice>,
+    native_window_move: Option<NativeWindowMove>,
+    pending_window_move_finished: Option<xproto::Window>,
+
     pub(crate) supports_xinput_gestures: bool,
 
     pub(crate) common: LinuxCommon,
@@ -254,7 +296,32 @@ impl X11ClientStatePtr {
         if state.cursor_hidden_window == Some(x_window) {
             state.cursor_hidden_window = None;
         }
+        if state
+            .native_window_move
+            .is_some_and(|native_move| native_move.window == x_window)
+        {
+            state.native_window_move = None;
+        }
+        if state.pending_window_move_finished == Some(x_window) {
+            state.pending_window_move_finished = None;
+        }
         state.cursor_styles.remove(&x_window);
+    }
+
+    pub fn start_window_move(&self, x_window: xproto::Window) {
+        let Some(client) = self.get_client() else {
+            return;
+        };
+        let mut state = client.0.borrow_mut();
+        if !state.supports_raw_events_during_grab {
+            return;
+        }
+
+        let pointer_device = state.last_left_button_device;
+        state.native_window_move = Some(NativeWindowMove {
+            window: x_window,
+            pointer_device,
+        });
     }
 
     pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
@@ -365,11 +432,16 @@ impl X11Client {
         );
         let supports_xinput_gestures = xinput_version.major_version > 2
             || (xinput_version.major_version == 2 && xinput_version.minor_version >= 4);
+        let supports_raw_events_during_grab = supports_raw_events_during_grab(
+            xinput_version.major_version,
+            xinput_version.minor_version,
+        );
         log::info!(
-            "XInput version: {}.{}, gesture support: {}",
+            "XInput version: {}.{}, gesture support: {}, raw events during grabs: {}",
             xinput_version.major_version,
             xinput_version.minor_version,
             supports_xinput_gestures,
+            supports_raw_events_during_grab,
         );
 
         let pointer_device_states =
@@ -381,6 +453,18 @@ impl X11Client {
             .context("Failed to get XCB atoms")?;
 
         let root = xcb_connection.setup().roots[0].root;
+        if supports_raw_events_during_grab {
+            check_reply(
+                || "X11 XiSelectEvents for raw button release failed",
+                xcb_connection.xinput_xi_select_events(
+                    root,
+                    &[xinput::EventMask {
+                        deviceid: XINPUT_ALL_DEVICE_GROUPS,
+                        mask: vec![xinput::XIEventMask::RAW_BUTTON_RELEASE],
+                    }],
+                ),
+            )?;
+        }
         let compositor_present = check_compositor_present(&xcb_connection, root);
         let gtk_frame_extents_supported =
             check_gtk_frame_extents_supported(&xcb_connection, &atoms, root);
@@ -554,6 +638,11 @@ impl X11Client {
 
             pointer_device_states,
 
+            supports_raw_events_during_grab,
+            last_left_button_device: None,
+            native_window_move: None,
+            pending_window_move_finished: None,
+
             supports_xinput_gestures,
 
             clipboard,
@@ -715,6 +804,53 @@ impl X11Client {
             }
         }
         Ok(())
+    }
+
+    fn schedule_window_move_finished(
+        &self,
+        detail: u32,
+        device_id: xinput::DeviceId,
+        source_id: xinput::DeviceId,
+    ) {
+        let loop_handle = {
+            let mut state = self.0.borrow_mut();
+            let releasing_last_left_button = detail == 1
+                && state
+                    .last_left_button_device
+                    .is_some_and(|pointer_device| pointer_device.matches(device_id, source_id));
+            if releasing_last_left_button {
+                state.last_left_button_device = None;
+            }
+
+            let Some(native_window_move) = state.native_window_move else {
+                return;
+            };
+            if !native_window_move.matches_release(detail, device_id, source_id) {
+                return;
+            }
+
+            state.native_window_move = None;
+            if state.pending_window_move_finished.is_some() {
+                return;
+            }
+            state.pending_window_move_finished = Some(native_window_move.window);
+            state.loop_handle.clone()
+        };
+
+        // Process ConfigureNotify events already queued with the release before docking can close
+        // the moved window.
+        loop_handle.insert_idle(|client| client.dispatch_window_move_finished());
+    }
+
+    fn dispatch_window_move_finished(&self) {
+        let x_window = self.0.borrow_mut().pending_window_move_finished.take();
+        let Some(x_window) = x_window else {
+            return;
+        };
+        let Some(window) = self.get_window(x_window) else {
+            return;
+        };
+        window.window_move_finished();
     }
 
     pub fn enable_ime(&self) {
@@ -1132,6 +1268,13 @@ impl X11Client {
                 let window = self.get_window(event.event)?;
                 let mut state = self.0.borrow_mut();
 
+                if event.detail == 1 {
+                    state.last_left_button_device = Some(PointerDevice {
+                        device_id: event.deviceid,
+                        source_id: event.sourceid,
+                    });
+                }
+
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
 
@@ -1205,7 +1348,11 @@ impl X11Client {
                     }
                 }
             }
+            Event::XinputRawButtonRelease(event) => {
+                self.schedule_window_move_finished(event.detail, event.deviceid, event.sourceid);
+            }
             Event::XinputButtonRelease(event) => {
+                self.schedule_window_move_finished(event.detail, event.deviceid, event.sourceid);
                 let window = self.get_window(event.event)?;
                 let mut state = self.0.borrow_mut();
                 let modifiers = modifiers_from_xinput_info(event.mods);
@@ -2801,6 +2948,37 @@ fn xkb_state_for_key_event(xkb: &xkbc::State, event_state: xproto::KeyButMask) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_events_during_grab_require_xinput_2_1() {
+        assert!(!supports_raw_events_during_grab(1, 9));
+        assert!(!supports_raw_events_during_grab(2, 0));
+        assert!(supports_raw_events_during_grab(2, 1));
+        assert!(supports_raw_events_during_grab(2, 4));
+        assert!(supports_raw_events_during_grab(3, 0));
+    }
+
+    #[test]
+    fn native_window_move_matches_its_left_button_release() {
+        let native_window_move = NativeWindowMove {
+            window: 42,
+            pointer_device: Some(PointerDevice {
+                device_id: 2,
+                source_id: 12,
+            }),
+        };
+
+        assert!(native_window_move.matches_release(1, 2, 12));
+        assert!(!native_window_move.matches_release(2, 2, 12));
+        assert!(!native_window_move.matches_release(1, 3, 12));
+        assert!(!native_window_move.matches_release(1, 2, 13));
+
+        let unknown_pointer_move = NativeWindowMove {
+            window: 42,
+            pointer_device: None,
+        };
+        assert!(unknown_pointer_move.matches_release(1, 9, 19));
+    }
 
     fn test_keymap(layouts: &str) -> xkbc::Keymap {
         test_keymap_with_variant(layouts, "")

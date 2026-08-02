@@ -248,6 +248,7 @@ pub struct Callbacks {
     hovered_status_change: Option<Box<dyn FnMut(bool)>>,
     resize: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved: Option<Box<dyn FnMut()>>,
+    window_move_finished: Option<Box<dyn FnMut()>>,
     should_close: Option<Box<dyn FnMut() -> bool>>,
     close: Option<Box<dyn FnOnce()>>,
     appearance_changed: Option<Box<dyn FnMut()>>,
@@ -989,7 +990,7 @@ impl X11Window {
                 pointer.root_x as u32,
                 pointer.root_y as u32,
                 flag,
-                0, // Left mouse button
+                1, // Left mouse button
                 0,
             ],
         );
@@ -1287,6 +1288,14 @@ impl X11WindowStatePtr {
         }
         if let Some(adapter) = self.state.borrow_mut().accesskit_adapter.as_mut() {
             adapter.update_window_focus_state(focus);
+        }
+    }
+
+    pub fn window_move_finished(&self) {
+        let callback = self.callbacks.borrow_mut().window_move_finished.take();
+        if let Some(mut fun) = callback {
+            fun();
+            self.callbacks.borrow_mut().window_move_finished = Some(fun);
         }
     }
 
@@ -1693,6 +1702,10 @@ impl PlatformWindow for X11Window {
         self.0.callbacks.borrow_mut().moved = Some(callback);
     }
 
+    fn on_window_move_finished(&self, callback: Box<dyn FnMut()>) {
+        self.0.callbacks.borrow_mut().window_move_finished = Some(callback);
+    }
+
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
         self.0.callbacks.borrow_mut().should_close = Some(callback);
     }
@@ -1785,7 +1798,13 @@ impl PlatformWindow for X11Window {
 
     fn start_window_move(&self) {
         const MOVERESIZE_MOVE: u32 = 8;
-        self.send_moveresize(MOVERESIZE_MOVE).log_err();
+        if self.send_moveresize(MOVERESIZE_MOVE).log_err().is_some() {
+            self.0
+                .state
+                .borrow()
+                .client
+                .start_window_move(self.0.x_window);
+        }
     }
 
     fn start_window_resize(&self, edge: ResizeEdge) {
