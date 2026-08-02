@@ -1029,6 +1029,7 @@ pub struct Window {
     capslock: Capslock,
     scale_factor: f32,
     pub(crate) bounds_observers: SubscriberSet<(), AnyObserver>,
+    pub(crate) window_move_finished_observers: SubscriberSet<(), AnyObserver>,
     appearance: WindowAppearance,
     pub(crate) appearance_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) button_layout_observers: SubscriberSet<(), AnyObserver>,
@@ -1579,6 +1580,14 @@ impl Window {
                     .log_err();
             }
         }));
+        platform_window.on_window_move_finished(Box::new({
+            let mut cx = cx.to_async();
+            move || {
+                handle
+                    .update(&mut cx, |_, window, cx| window.window_move_finished(cx))
+                    .log_err();
+            }
+        }));
         platform_window.on_appearance_changed(Box::new({
             let mut cx = cx.to_async();
             move || {
@@ -1747,6 +1756,7 @@ impl Window {
             capslock,
             scale_factor,
             bounds_observers: SubscriberSet::new(),
+            window_move_finished_observers: SubscriberSet::new(),
             appearance,
             appearance_observers: SubscriberSet::new(),
             button_layout_observers: SubscriberSet::new(),
@@ -2450,9 +2460,42 @@ impl Window {
             .retain(&(), |callback| callback(self, cx));
     }
 
+    /// Notify observers that an interactive platform window move has finished.
+    pub fn window_move_finished(&mut self, cx: &mut App) {
+        self.window_move_finished_observers
+            .clone()
+            .retain(&(), |callback| callback(self, cx));
+    }
+
     /// Returns the bounds of the current window in the global coordinate space, which could span across multiple displays.
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.platform_window.bounds()
+    }
+
+    /// Returns the window frame in a top-left-origin desktop coordinate system.
+    ///
+    /// The returned coordinates are only intended to be compared with values from
+    /// [`Self::desktop_mouse_position`]. Units are platform-native and are not guaranteed to be
+    /// GPUI logical pixels.
+    pub fn desktop_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.platform_window.desktop_bounds()
+    }
+
+    /// Returns the pointer position in a top-left-origin desktop coordinate system.
+    ///
+    /// The returned coordinates are only intended to be compared with values from
+    /// [`Self::desktop_bounds`].
+    pub fn desktop_mouse_position(&self) -> Option<Point<Pixels>> {
+        self.platform_window.desktop_mouse_position()
+    }
+
+    /// Returns the number of desktop coordinate units occupied by one GPUI logical pixel.
+    ///
+    /// Scale logical lengths by this value before combining them with [`Self::desktop_bounds`].
+    /// This differs from [`Self::scale_factor`] on platforms whose native desktop coordinates are
+    /// already expressed in logical points.
+    pub fn desktop_coordinate_scale_factor(&self) -> Option<f32> {
+        self.platform_window.desktop_coordinate_scale_factor()
     }
 
     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
@@ -6611,8 +6654,8 @@ pub fn outline(
 mod tests {
     use crate::{
         AppContext as _, Bounds, Context, FocusHandle, InteractiveElement as _, IntoElement,
-        ParentElement as _, Pixels, Render, Styled as _, TestAppContext, Window, canvas, div, px,
-        size,
+        Modifiers, MouseMoveEvent, ParentElement as _, Pixels, PlatformInput, Render, Styled as _,
+        TestAppContext, Window, canvas, div, point, px, size,
     };
     use std::{cell::Cell, rc::Rc};
 
@@ -6679,6 +6722,75 @@ mod tests {
         .unwrap();
 
         assert_eq!(child_bounds.get().size, size(px(300.), px(200.)));
+    }
+
+    #[test]
+    fn test_desktop_coordinates() {
+        let mut cx = TestAppContext::single();
+        let child_bounds = Rc::new(Cell::new(Bounds::default()));
+        let window = cx.add_window(move |_, _| RootView {
+            explicit_size: false,
+            child_bounds,
+        });
+
+        let local_mouse = point(px(24.), px(12.));
+        cx.test_window(window.into())
+            .simulate_input(PlatformInput::MouseMove(MouseMoveEvent {
+                position: local_mouse,
+                pressed_button: None,
+                modifiers: Modifiers::default(),
+            }));
+        let desktop_origin = point(px(320.), px(180.));
+        cx.simulate_window_move(window.into(), desktop_origin);
+
+        window
+            .update(&mut cx, |_, window, _| {
+                assert_eq!(window.desktop_bounds(), Some(window.bounds()));
+                assert_eq!(
+                    window.desktop_mouse_position(),
+                    Some(desktop_origin + local_mouse)
+                );
+                assert_eq!(window.desktop_coordinate_scale_factor(), Some(1.));
+                assert_eq!(window.scale_factor(), 2.);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn test_observe_window_move_finished(cx: &mut TestAppContext) {
+        let move_finished_count = Rc::new(Cell::new(0));
+        let bounds_change_count = Rc::new(Cell::new(0));
+        let child_bounds = Rc::new(Cell::new(Bounds::default()));
+        let window = cx.add_window({
+            let move_finished_count = move_finished_count.clone();
+            let bounds_change_count = bounds_change_count.clone();
+            move |window, cx| {
+                cx.observe_window_move_finished(window, move |_, _, _| {
+                    move_finished_count.set(move_finished_count.get() + 1);
+                })
+                .detach();
+                cx.observe_window_bounds(window, move |_, _, _| {
+                    bounds_change_count.set(bounds_change_count.get() + 1);
+                })
+                .detach();
+                RootView {
+                    explicit_size: false,
+                    child_bounds,
+                }
+            }
+        });
+
+        cx.simulate_window_resize(window.into(), size(px(640.), px(480.)));
+        assert_eq!(move_finished_count.get(), 0);
+        assert_eq!(bounds_change_count.get(), 1);
+
+        cx.simulate_window_move(window.into(), point(px(400.), px(300.)));
+        assert_eq!(move_finished_count.get(), 0);
+        assert_eq!(bounds_change_count.get(), 2);
+
+        cx.simulate_window_move_finished(window.into());
+        cx.simulate_window_move_finished(window.into());
+        assert_eq!(move_finished_count.get(), 2);
     }
 
     struct FocusForwarder {

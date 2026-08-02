@@ -324,6 +324,25 @@ pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -
     )
 }
 
+fn desktop_top() -> Option<f64> {
+    unsafe {
+        let screens = NSScreen::screens(nil);
+        let count = NSArray::count(screens);
+        let mut desktop_top: Option<f64> = None;
+        for index in 0..count {
+            let screen = NSArray::objectAtIndex(screens, index);
+            let frame = NSScreen::frame(screen);
+            let screen_top = frame.origin.y + frame.size.height;
+            desktop_top = Some(desktop_top.map_or(screen_top, |top| top.max(screen_top)));
+        }
+        desktop_top
+    }
+}
+
+fn top_left_desktop_y(desktop_top: f64, bottom_left_y: f64, height: f64) -> f64 {
+    desktop_top - bottom_left_y - height
+}
+
 /// Stores the cursor style on the active GPUI window and invalidates its cursor rects.
 ///
 /// # Safety
@@ -504,6 +523,7 @@ struct MacWindowState {
     activate_callback: Option<Box<dyn FnMut(bool)>>,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
+    window_move_finished_callback: Option<Box<dyn FnMut()>>,
     should_close_callback: Option<Box<dyn FnMut() -> bool>>,
     close_callback: Option<Box<dyn FnOnce()>>,
     appearance_changed_callback: Option<Box<dyn FnMut()>>,
@@ -905,6 +925,7 @@ impl MacWindow {
                 activate_callback: None,
                 resize_callback: None,
                 moved_callback: None,
+                window_move_finished_callback: None,
                 should_close_callback: None,
                 close_callback: None,
                 appearance_changed_callback: None,
@@ -1233,6 +1254,31 @@ impl PlatformWindow for MacWindow {
                 })
             })
             .detach();
+    }
+
+    fn desktop_bounds(&self) -> Option<Bounds<Pixels>> {
+        let desktop_top = desktop_top()?;
+        let frame = unsafe { NSWindow::frame(self.0.lock().native_window) };
+        Some(Bounds::new(
+            point(
+                px(frame.origin.x as f32),
+                px(top_left_desktop_y(desktop_top, frame.origin.y, frame.size.height) as f32),
+            ),
+            size(px(frame.size.width as f32), px(frame.size.height as f32)),
+        ))
+    }
+
+    fn desktop_mouse_position(&self) -> Option<Point<Pixels>> {
+        let desktop_top = desktop_top()?;
+        let position = unsafe { NSEvent::mouseLocation(nil) };
+        Some(point(
+            px(position.x as f32),
+            px(top_left_desktop_y(desktop_top, position.y, 0.) as f32),
+        ))
+    }
+
+    fn desktop_coordinate_scale_factor(&self) -> Option<f32> {
+        Some(1.)
     }
 
     fn merge_all_windows(&self) {
@@ -1689,6 +1735,10 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().moved_callback = Some(callback);
     }
 
+    fn on_window_move_finished(&self, callback: Box<dyn FnMut()>) {
+        self.0.as_ref().lock().window_move_finished_callback = Some(callback);
+    }
+
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
         self.0.as_ref().lock().should_close_callback = Some(callback);
     }
@@ -1847,14 +1897,35 @@ impl PlatformWindow for MacWindow {
     }
 
     fn start_window_move(&self) {
-        let this = self.0.lock();
-        let window = this.native_window;
+        let (window, executor, closed) = {
+            let this = self.0.lock();
+            (
+                this.native_window,
+                this.foreground_executor.clone(),
+                this.closed.clone(),
+            )
+        };
 
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let event: id = msg_send![app, currentEvent];
             let _: () = msg_send![window, performWindowDragWithEvent: event];
         }
+
+        let window_state = self.0.clone();
+        executor
+            .spawn(async move {
+                if closed.load(Ordering::Acquire) {
+                    return;
+                }
+
+                let callback = window_state.lock().window_move_finished_callback.take();
+                if let Some(mut callback) = callback {
+                    callback();
+                    window_state.lock().window_move_finished_callback = Some(callback);
+                }
+            })
+            .detach();
     }
 
     fn play_system_bell(&self) {
@@ -3228,6 +3299,13 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_desktop_y_is_normalized_to_top_left() {
+        let desktop_top = 2160.;
+        assert_eq!(top_left_desktop_y(desktop_top, 1080., 600.), 480.);
+        assert_eq!(top_left_desktop_y(desktop_top, 1080., 0.), 1080.);
+    }
 
     #[test]
     fn display_id_for_screen_returns_none_for_null_screen() {

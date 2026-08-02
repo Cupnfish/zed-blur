@@ -376,6 +376,17 @@ impl TestAppContext {
         self.test_window(window_handle).simulate_resize(size);
     }
 
+    /// Simulates moving the window to a new desktop origin.
+    pub fn simulate_window_move(&self, window_handle: AnyWindowHandle, origin: Point<Pixels>) {
+        self.test_window(window_handle).simulate_move(origin);
+    }
+
+    /// Simulates completing an interactive platform window move.
+    pub fn simulate_window_move_finished(&self, window_handle: AnyWindowHandle) {
+        self.test_window(window_handle)
+            .simulate_window_move_finished();
+    }
+
     /// Returns true if there's an alert dialog open.
     pub fn expect_restart(&self) -> oneshot::Receiver<Option<PathBuf>> {
         let (tx, rx) = futures::channel::oneshot::channel();
@@ -855,6 +866,16 @@ impl VisualTestContext {
     /// Simulates the user resizing the window to the new size.
     pub fn simulate_resize(&self, size: Size<Pixels>) {
         self.simulate_window_resize(self.window, size)
+    }
+
+    /// Simulates moving this window to a new desktop origin.
+    pub fn simulate_move(&self, origin: Point<Pixels>) {
+        self.simulate_window_move(self.window, origin)
+    }
+
+    /// Simulates completing an interactive platform window move.
+    pub fn simulate_move_finished(&self) {
+        self.simulate_window_move_finished(self.window)
     }
 
     /// debug_bounds returns the bounds of the element with the given selector.

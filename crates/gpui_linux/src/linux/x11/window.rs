@@ -1373,6 +1373,18 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().content_size()
     }
 
+    fn desktop_bounds(&self) -> Option<Bounds<Pixels>> {
+        Some(self.bounds())
+    }
+
+    fn desktop_mouse_position(&self) -> Option<Point<Pixels>> {
+        Some(self.bounds().origin + self.mouse_position())
+    }
+
+    fn desktop_coordinate_scale_factor(&self) -> Option<f32> {
+        Some(1.)
+    }
+
     fn resize(&mut self, size: Size<Pixels>) {
         let state = self.0.state.borrow();
         let size = size.to_device_pixels(state.scale_factor);

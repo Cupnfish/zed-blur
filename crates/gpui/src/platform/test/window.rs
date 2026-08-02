@@ -17,6 +17,7 @@ use std::{
 
 pub(crate) struct TestWindowState {
     pub(crate) bounds: Bounds<Pixels>,
+    mouse_position: Point<Pixels>,
     pub(crate) handle: AnyWindowHandle,
     display: Rc<dyn PlatformDisplay>,
     pub(crate) title: Option<String>,
@@ -33,6 +34,7 @@ pub(crate) struct TestWindowState {
     hover_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     resize_callback: Option<Box<dyn FnMut(Size<Pixels>, f32)>>,
     moved_callback: Option<Box<dyn FnMut()>>,
+    window_move_finished_callback: Option<Box<dyn FnMut()>>,
     input_handler: Option<PlatformInputHandler>,
     is_fullscreen: bool,
 }
@@ -70,6 +72,7 @@ impl TestWindow {
         };
         Self(Rc::new(Mutex::new(TestWindowState {
             bounds: params.bounds,
+            mouse_position: Point::default(),
             display,
             platform,
             handle,
@@ -85,6 +88,7 @@ impl TestWindow {
             hover_status_change_callback: None,
             resize_callback: None,
             moved_callback: None,
+            window_move_finished_callback: None,
             input_handler: None,
             is_fullscreen: false,
         })))
@@ -103,6 +107,17 @@ impl TestWindow {
         self.0.lock().resize_callback = Some(callback);
     }
 
+    pub fn simulate_move(&mut self, origin: Point<Pixels>) {
+        let mut lock = self.0.lock();
+        lock.bounds.origin = origin;
+        let Some(mut callback) = lock.moved_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback();
+        self.0.lock().moved_callback = Some(callback);
+    }
+
     pub(crate) fn simulate_active_status_change(&self, active: bool) {
         let mut lock = self.0.lock();
         let Some(mut callback) = lock.active_status_change_callback.take() else {
@@ -113,8 +128,32 @@ impl TestWindow {
         self.0.lock().active_status_change_callback = Some(callback);
     }
 
+    pub fn simulate_window_move_finished(&self) {
+        let mut lock = self.0.lock();
+        let Some(mut callback) = lock.window_move_finished_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback();
+        self.0.lock().window_move_finished_callback = Some(callback);
+    }
+
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
         let mut lock = self.0.lock();
+        let position = match &event {
+            PlatformInput::MouseDown(event) => Some(event.position),
+            PlatformInput::MouseUp(event) => Some(event.position),
+            PlatformInput::MouseMove(event) => Some(event.position),
+            PlatformInput::ScrollWheel(event) => Some(event.position),
+            PlatformInput::Pinch(event) => Some(event.position),
+            PlatformInput::FileDrop(crate::FileDropEvent::Entered { position, .. })
+            | PlatformInput::FileDrop(crate::FileDropEvent::Pending { position })
+            | PlatformInput::FileDrop(crate::FileDropEvent::Submit { position }) => Some(*position),
+            _ => None,
+        };
+        if let Some(position) = position {
+            lock.mouse_position = position;
+        }
         let Some(mut callback) = lock.input_callback.take() else {
             return false;
         };
@@ -151,6 +190,18 @@ impl PlatformWindow for TestWindow {
         2.0
     }
 
+    fn desktop_bounds(&self) -> Option<Bounds<Pixels>> {
+        Some(self.bounds())
+    }
+
+    fn desktop_mouse_position(&self) -> Option<Point<Pixels>> {
+        Some(self.bounds().origin + self.mouse_position())
+    }
+
+    fn desktop_coordinate_scale_factor(&self) -> Option<f32> {
+        Some(1.)
+    }
+
     fn appearance(&self) -> WindowAppearance {
         WindowAppearance::Light
     }
@@ -160,7 +211,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
-        Point::default()
+        self.0.lock().mouse_position
     }
 
     fn modifiers(&self) -> crate::Modifiers {
@@ -278,6 +329,10 @@ impl PlatformWindow for TestWindow {
 
     fn on_moved(&self, callback: Box<dyn FnMut()>) {
         self.0.lock().moved_callback = Some(callback)
+    }
+
+    fn on_window_move_finished(&self, callback: Box<dyn FnMut()>) {
+        self.0.lock().window_move_finished_callback = Some(callback)
     }
 
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {

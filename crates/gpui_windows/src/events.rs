@@ -51,8 +51,28 @@ impl WindowsWindowInner {
             WM_MOVE => self.handle_move_msg(handle, lparam),
             WM_SIZE => self.handle_size_msg(wparam, lparam),
             WM_GETMINMAXINFO => self.handle_get_min_max_info_msg(lparam),
-            WM_ENTERSIZEMOVE | WM_ENTERMENULOOP => self.handle_size_move_loop(handle),
-            WM_EXITSIZEMOVE | WM_EXITMENULOOP => self.handle_size_move_loop_exit(handle),
+            WM_ENTERSIZEMOVE => {
+                self.state.interactive_size_move.set(true);
+                self.state.interactive_window_move.set(false);
+                self.handle_size_move_loop(handle)
+            }
+            WM_ENTERMENULOOP => self.handle_size_move_loop(handle),
+            WM_MOVING => {
+                if self.state.interactive_size_move.get() {
+                    self.state.interactive_window_move.set(true);
+                }
+                None
+            }
+            WM_EXITSIZEMOVE => {
+                let result = self.handle_size_move_loop_exit(handle);
+                let was_interactive = self.state.interactive_size_move.replace(false);
+                let moved = self.state.interactive_window_move.replace(false);
+                if was_interactive && moved {
+                    self.handle_window_move_finished();
+                }
+                result
+            }
+            WM_EXITMENULOOP => self.handle_size_move_loop_exit(handle),
             WM_TIMER => self.handle_timer_msg(handle, wparam),
             WM_NCCALCSIZE => self.handle_calc_client_size(handle, wparam, lparam),
             WM_DPICHANGED => self.handle_dpi_changed_msg(handle, wparam, lparam),
@@ -248,6 +268,16 @@ impl WindowsWindowInner {
             KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID).log_err();
         }
         None
+    }
+
+    fn handle_window_move_finished(&self) {
+        if let Some(mut callback) = self.state.callbacks.window_move_finished.take() {
+            callback();
+            self.state
+                .callbacks
+                .window_move_finished
+                .set(Some(callback));
+        }
     }
 
     fn handle_timer_msg(&self, handle: HWND, wparam: WPARAM) -> Option<isize> {

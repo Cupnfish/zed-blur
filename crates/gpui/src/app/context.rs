@@ -440,6 +440,24 @@ impl<'a, T: 'static> Context<'a, T> {
         subscription
     }
 
+    /// Register a callback to be invoked when an interactive platform window move finishes.
+    pub fn observe_window_move_finished(
+        &self,
+        window: &mut Window,
+        mut callback: impl FnMut(&mut T, &mut Window, &mut Context<T>) + 'static,
+    ) -> Subscription {
+        let view = self.weak_entity();
+        let (subscription, activate) = window.window_move_finished_observers.insert(
+            (),
+            Box::new(move |window, cx| {
+                view.update(cx, |view, cx| callback(view, window, cx))
+                    .is_ok()
+            }),
+        );
+        activate();
+        subscription
+    }
+
     /// Register a callback to be invoked when the window is activated or deactivated.
     pub fn observe_window_activation(
         &self,

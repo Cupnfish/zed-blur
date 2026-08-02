@@ -57,6 +57,8 @@ pub struct WindowsWindowState {
     pub restore_from_minimized: Cell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
 
     pub callbacks: Callbacks,
+    pub interactive_size_move: Cell<bool>,
+    pub interactive_window_move: Cell<bool>,
     pub input_handler: Cell<Option<PlatformInputHandler>>,
     pub ime_enabled: Cell<bool>,
     pub pending_surrogate: Cell<Option<u16>>,
@@ -166,6 +168,8 @@ impl WindowsWindowState {
             restore_from_minimized: Cell::new(restore_from_minimized),
             min_size,
             callbacks,
+            interactive_size_move: Cell::new(false),
+            interactive_window_move: Cell::new(false),
             input_handler: Cell::new(input_handler),
             ime_enabled: Cell::new(true),
             pending_surrogate: Cell::new(pending_surrogate),
@@ -408,6 +412,7 @@ pub(crate) struct Callbacks {
     pub(crate) hovered_status_change: Cell<Option<Box<dyn FnMut(bool)>>>,
     pub(crate) resize: Cell<Option<Box<dyn FnMut(Size<Pixels>, f32)>>>,
     pub(crate) moved: Cell<Option<Box<dyn FnMut()>>>,
+    pub(crate) window_move_finished: Cell<Option<Box<dyn FnMut()>>>,
     pub(crate) should_close: Cell<Option<Box<dyn FnMut() -> bool>>>,
     pub(crate) close: Cell<Option<Box<dyn FnOnce()>>>,
     pub(crate) hit_test_window_control: Cell<Option<Box<dyn FnMut() -> Option<WindowControlArea>>>>,
@@ -675,6 +680,28 @@ impl PlatformWindow for WindowsWindow {
                 }
             })
             .detach();
+    }
+
+    fn desktop_bounds(&self) -> Option<Bounds<Pixels>> {
+        let mut rect = RECT::default();
+        unsafe { GetWindowRect(self.0.hwnd, &mut rect) }.ok()?;
+        Some(Bounds::new(
+            point(px(rect.left as f32), px(rect.top as f32)),
+            size(
+                px((rect.right - rect.left) as f32),
+                px((rect.bottom - rect.top) as f32),
+            ),
+        ))
+    }
+
+    fn desktop_mouse_position(&self) -> Option<Point<Pixels>> {
+        let mut position = POINT::default();
+        unsafe { GetCursorPos(&mut position) }.ok()?;
+        Some(point(px(position.x as f32), px(position.y as f32)))
+    }
+
+    fn desktop_coordinate_scale_factor(&self) -> Option<f32> {
+        Some(self.scale_factor())
     }
 
     fn scale_factor(&self) -> f32 {
@@ -984,6 +1011,13 @@ impl PlatformWindow for WindowsWindow {
 
     fn on_moved(&self, callback: Box<dyn FnMut()>) {
         self.state.callbacks.moved.set(Some(callback));
+    }
+
+    fn on_window_move_finished(&self, callback: Box<dyn FnMut()>) {
+        self.state
+            .callbacks
+            .window_move_finished
+            .set(Some(callback));
     }
 
     fn on_should_close(&self, callback: Box<dyn FnMut() -> bool>) {
